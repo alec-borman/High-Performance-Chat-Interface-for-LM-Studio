@@ -49,7 +49,7 @@ DEVICE = torch.device("cuda" if USE_GPU else "cpu")
 logger.info(f"GPU Available: {USE_GPU}, Device: {DEVICE}")
 
 MODEL_MAX_TOKENS = 32768
-EMBEDDING_MODEL_MAX_TOKENS = 2048
+EMBEDDING_MODEL_MAX_TOKENS = 8192  # Updated to 8192 for Nomic Embed
 AVERAGE_CHARS_PER_TOKEN = 4
 BUFFER_TOKENS = 1500
 MIN_OUTPUT_TOKENS = 500
@@ -101,34 +101,45 @@ async def get_embeddings(client, text, embedding_model="nomic_embed_text_v1_5_f1
         logger.warning("Attempted to get embeddings for empty text.")
         return None
 
-    # Truncate the text to fit within the embedding model's token limit
-    tokens = text.split()
-    if len(tokens) > EMBEDDING_MODEL_MAX_TOKENS:
-        truncated_text = ' '.join(tokens[:EMBEDDING_MODEL_MAX_TOKENS])
-    else:
-        truncated_text = text
+    # Split the text into chunks of up to 8192 tokens
+    tokenized_text = text.split()
+    chunks = []
+    
+    while tokenized_text:
+        current_chunk = ' '.join(tokenized_text[:EMBEDDING_MODEL_MAX_TOKENS])
+        chunks.append(current_chunk)
+        tokenized_text = tokenized_text[EMBEDDING_MODEL_MAX_TOKENS:]
 
-    url = f"{BASE_URL}/embeddings"
-    payload = {
-        "model": embedding_model,
-        "input": [truncated_text]
-    }
-    try:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        embedding = data["data"][0]["embedding"]
-        logger.info("Successfully retrieved embeddings.")
-        return embedding
-    except (httpx.RequestError, httpx.HTTPStatusError) as e:
-        logger.error(f"HTTP error while getting embeddings: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON decoding error while getting embeddings: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error while getting embeddings: {e}")
-        return None
+    embeddings = []
+
+    for chunk in chunks:
+        url = f"{BASE_URL}/embeddings"
+        payload = {
+            "model": embedding_model,
+            "input": [chunk]
+        }
+        try:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            embedding = np.array(data["data"][0]["embedding"])
+            logger.info("Successfully retrieved embeddings.")
+            embeddings.append(embedding)
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            logger.error(f"HTTP error while getting embeddings: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decoding error while getting embeddings: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error while getting embeddings: {e}")
+            return None
+
+    # Combine embeddings from multiple chunks if necessary
+    combined_embedding = np.concatenate(embeddings)
+    
+    logger.info(f"Combined embedding length: {len(combined_embedding)}")
+    return combined_embedding.tolist()
 
 def calculate_similarity(vec1, vec2):
     """
