@@ -648,3 +648,6 @@ RUN pip install -r requirements.txt
 CMD ["python", "main.py"]
 Conclusion
 The High-Performance Chat Interface provides a seamless and powerful chat experience with LM Studio. Its extensibility through plugins and advanced context handling make it a versatile tool for various applications.
+
+Conclusion
+
