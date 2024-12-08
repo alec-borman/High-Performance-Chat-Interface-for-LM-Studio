@@ -1,6 +1,6 @@
 # 🚀 High-Performance Chat Interface for LM Studio – Enhanced Version
 
-
+![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)
 
 ## Overview
 
@@ -78,7 +78,7 @@ This repository hosts a **robust and efficient web-based chat application** that
 python main.py
 ```
 
-**Access the Interface:** Open your browser and go to [http://127.0.0.1:7860/](http://127.0.0.1:7860/).
+**Access the Interface:** Open your browser and go to [http://127.0.0.1:7860/](http://127.0.0.1:7860/). If `share=True`, Gradio deploys a publicly accessible link for 72 hours.
 
 **Interact with Models:**
 
@@ -141,8 +141,6 @@ The High-Performance Chat Interface is designed to provide seamless, real-time i
 - Internal Reasoning Steps
 - Plugin Output Example (Database Query)
 
-
-
 ## Code Structure
 
 - `main.py`: Core script handling API interactions, chat logic, and Gradio interface.
@@ -188,6 +186,7 @@ Orchestrates:
 
 Builds a user-friendly Gradio UI featuring:
 
+- If `share=True`, Gradio deploys a publicly accessible link for 72 hours.
 - Text input for messages.
 - File upload for supplemental context.
 - Model selection and parameter controls.
