@@ -1,30 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-High-Performance Chat Interface for LM Studio - Enhanced Version
-
-This script creates a robust and efficient chat interface using Gradio,
-facilitating seamless interactions with the LM Studio API. It leverages
-GPU capabilities for accelerated processing and utilizes asynchronous operations
-for improved responsiveness. Token handling is dynamically adjusted for optimal
-performance.
-
-Author: Bard (Based on Your Original Script)
-Date: 2023-11-22 (Updated 2024-12-08)
-"""
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import gradio as gr
 import httpx
 import json
-import os
 import numpy as np
 import torch
 import asyncio
 import logging
 from functools import lru_cache
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 import re  # Added import for regex module
+import faiss
+import psutil
+from cryptography.fernet import Fernet
 
 # ===========================
 # Logging Configuration
@@ -49,13 +41,12 @@ DEVICE = torch.device("cuda" if USE_GPU else "cpu")
 logger.info(f"GPU Available: {USE_GPU}, Device: {DEVICE}")
 
 MODEL_MAX_TOKENS = 32768
-EMBEDDING_MODEL_MAX_TOKENS = 8192  # Updated to 8192 for Nomic Embed
+EMBEDDING_MODEL_MAX_TOKENS = 8192  # Define EMBEDDING_MODEL_MAX_TOKENS
 AVERAGE_CHARS_PER_TOKEN = 4
 BUFFER_TOKENS = 1500
 MIN_OUTPUT_TOKENS = 500
 
-MAX_EMBEDDINGS = 100
-HTTPX_TIMEOUT = 3000
+HTTPX_TIMEOUT = 3000  # Define HTTPX_TIMEOUT
 
 HISTORY_FILE_PATH = "chat_history.json"
 
@@ -84,7 +75,17 @@ def calculate_max_tokens(message_history_length, model_max_tokens=MODEL_MAX_TOKE
     logger.info(f"Calculated max tokens: {calculated_max}")
     return calculated_max
 
-async def get_embeddings(client, text, embedding_model="nomic_embed_text_v1_5_f16.gguf"):
+def get_max_embeddings():
+    total_memory = psutil.virtual_memory().total
+    # Allocate a fraction of total memory for embeddings
+    max_embedding_size = 768 * np.dtype(np.float32).itemsize
+    max_embeddings = int(total_memory * 0.1 / max_embedding_size)  # Adjust the fraction as needed
+    logger.info(f"Maximum embeddings set to: {max_embeddings}")
+    return max_embeddings
+
+MAX_EMBEDDINGS = get_max_embeddings()
+
+async def get_embeddings(client, text, embedding_model="nomic-embed-text-v1.5.f32.gguf"):
     """
     Retrieves embeddings from the LM Studio API.
 
@@ -162,6 +163,66 @@ def calculate_similarity(vec1, vec2):
     similarity = torch.nn.functional.cosine_similarity(vec1_tensor.unsqueeze(0), vec2_tensor.unsqueeze(0)).item()
     logger.info(f"Calculated similarity: {similarity}")
     return similarity
+
+# ===========================
+# Faiss Vector Database
+# ===========================
+
+class FastVectorDatabase:
+    def __init__(self, dimension=768, max_embeddings=MAX_EMBEDDINGS):
+        """
+        Initializes the vector database.
+
+        Args:
+            dimension (int): Dimension of the embeddings.
+            max_embeddings (int): Maximum number of embeddings to store.
+        """
+        self.dimension = dimension
+        self.max_embeddings = max_embeddings
+        self.index = faiss.IndexIVFFlat(faiss.IndexFlatIP(dimension), dimension, 200)  # More efficient indexing
+        self.messages = []
+    
+    def add_embedding(self, message, embedding):
+        """
+        Adds a message and its embedding to the database.
+
+        Args:
+            message (str): The message.
+            embedding (list or np.ndarray): The embedding vector.
+        """
+        if len(self.messages) >= self.max_embeddings:
+            logger.info("Database is full. Removing oldest embedding.")
+            self.messages.pop(0)
+            # Remove the first entry from the index
+            new_index = faiss.IndexIVFFlat(faiss.IndexFlatIP(self.dimension), self.dimension, 200)
+            embeddings = [np.array(msg[1], dtype=np.float32) for msg in self.messages]
+            if embeddings:
+                new_embeddings = np.vstack(embeddings)
+                new_index.add(new_embeddings)
+            self.index = new_index
+        
+        embedding_np = np.array(embedding, dtype=np.float32).reshape(1, -1)
+        self.index.add(embedding_np)
+        self.messages.append((message, embedding))
+    
+    def retrieve_relevant_context(self, user_embedding):
+        """
+        Retrieves relevant context based on similarity scores.
+
+        Args:
+            user_embedding (list or np.ndarray): The embedding of the user message.
+
+        Returns:
+            list: List of relevant messages.
+        """
+        user_embedding_np = np.array(user_embedding, dtype=np.float32).reshape(1, -1)
+        distances, indices = self.index.search(user_embedding_np, min(len(self.messages), 5))
+        relevant_messages = [self.messages[idx][0] for idx in indices[0]]
+        logger.info(f"Retrieved relevant messages: {relevant_messages}")
+        return relevant_messages
+
+# Initialize the vector database
+vector_db = FastVectorDatabase(dimension=768)
 
 # ===========================
 # Internal Reasoning Mechanism (Enhanced)
@@ -316,6 +377,15 @@ async def database_query_plugin(message, context_display):
 
         conn = sqlite3.connect('example.db')
         cursor = conn.cursor()
+
+        # Create the table if it does not exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS example_table (
+                message TEXT,
+                data TEXT
+            )
+        """)
+        
         cursor.execute("SELECT * FROM example_table WHERE message=?", (message,))
         result = cursor.fetchone()
         conn.close()
@@ -328,17 +398,67 @@ async def database_query_plugin(message, context_display):
 plugin_manager.register_plugin("Database Query", database_query_plugin)
 
 # ===========================
+# Encryption/Decryption
+# ===========================
+
+def load_key():
+    """
+    Load the encryption key from a file or generate a new one.
+    """
+    key_path = "encryption.key"
+    if os.path.exists(key_path):
+        with open(key_path, "rb") as key_file:
+            key = key_file.read()
+    else:
+        key = Fernet.generate_key()
+        with open(key_path, "wb") as key_file:
+            key_file.write(key)
+    return key
+
+key = load_key()
+cipher_suite = Fernet(key)
+
+def encrypt_data(data):
+    """
+    Encrypts the given data.
+
+    Args:
+        data (str): The data to encrypt.
+
+    Returns:
+        str: Encrypted data.
+    """
+    encrypted_data = cipher_suite.encrypt(data.encode())
+    return encrypted_data
+
+def decrypt_data(encrypted_data):
+    """
+    Decrypts the given encrypted data.
+
+    Args:
+        encrypted_data (bytes): The encrypted data to decrypt.
+
+    Returns:
+        str: Decrypted data.
+    """
+    decrypted_data = cipher_suite.decrypt(encrypted_data).decode()
+    return decrypted_data
+
+# ===========================
 # Handlers for Chat
 # ===========================
 
-async def chat_handler(message, file_obj, state, internal_reasoning, model_name, temperature, top_p, chatbot_history, context_display):
+class StopGeneratorException(Exception):
+    pass
+
+async def chat_handler(message, file_obj, state, internal_reasoning, model_name, temperature, top_p, chatbot_history, context_display, thought_process_textbox, stop_generation_state):
     logger.info("Handling new user message.")
 
     try:
         # Strip whitespace from the message
         original_message = message.strip()
         if not original_message:
-            yield chatbot_history, state, ""
+            yield chatbot_history, state, "", ""
             return
 
         embeddings = state.get("embeddings", [])
@@ -357,16 +477,16 @@ async def chat_handler(message, file_obj, state, internal_reasoning, model_name,
                 message += f"\n[File Content]:\n{file_content}"
             except ValueError as e:
                 updated_chat.append([original_message, str(e)])
-                yield updated_chat, state, ""
+                yield updated_chat, state, "", ""
                 return
             except UnicodeDecodeError:
-                updated_chat.append([original_message, "Error: Could not decode file. Ensure it is a UTF-8 encoded text file."])
-                yield updated_chat, state, ""
+                updated_chat.append([original_message, "Error: Could not decode file. Ensure it is a UTF-08 encoded text file."])
+                yield updated_chat, state, "", ""
                 return
             except Exception as e:
                 logger.error(f"Error reading file: {e}")
                 updated_chat.append([original_message, "Error reading file."])
-                yield updated_chat, state, ""
+                yield updated_chat, state, "", ""
                 return
 
         # Embeddings generation
@@ -377,7 +497,7 @@ async def chat_handler(message, file_obj, state, internal_reasoning, model_name,
             messages_history.append({"role": "user", "content": original_message})
         else:
             updated_chat.append([original_message, "Failed to generate embeddings."])
-            yield updated_chat, state, ""
+            yield updated_chat, state, "", ""
             return
 
         if len(embeddings) > MAX_EMBEDDINGS:
@@ -431,18 +551,29 @@ async def chat_handler(message, file_obj, state, internal_reasoning, model_name,
         plugin_output = "\n".join(f"{name}: {result}" for name, result in plugin_results)
         if plugin_output:
             updated_chat.append([None, plugin_output])
+            thought_process_textbox += f"\n{plugin_output}\n"
 
         history.append({"role": "user", "content": original_message})  # Appended current message to LM Studio history
+
         try:
             logger.info("Sending chat request to LM Studio.")
             async for chunk in chat_with_lmstudio(client, history, model_name, temperature, top_p, max_tokens):
+                if stop_generation_state["stop"]:
+                    logger.info("Stop generation event triggered.")
+                    break
                 response += chunk
                 updated_chat[-1] = [original_message, response]  # Update last message with response
-                yield updated_chat, {"embeddings": embeddings, "messages_history": messages_history}, context_text
+                thought_process_textbox += f"\n{response}"
+                yield updated_chat, {"embeddings": embeddings, "messages_history": messages_history}, context_text, thought_process_textbox
+
+                # Store the new embedding and message in the vector database
+                vector_db.add_embedding(original_message, user_embedding)
+        except StopGeneratorException:
+            logger.info("Stop generation event triggered.")
         except Exception as e:
             logger.error(f"Error during chat response generation: {e}")
             updated_chat.append([original_message, "An error occurred."])  # Update last message with error
-            yield updated_chat, state, ""
+            yield updated_chat, state, "", ""
             return
 
         messages_history.append({"role": "assistant", "content": response})  # Append assistant response to message history
@@ -450,8 +581,9 @@ async def chat_handler(message, file_obj, state, internal_reasoning, model_name,
         # Save conversation history to file
         new_state = {"embeddings": embeddings, "messages_history": messages_history}
         try:
-            with open(HISTORY_FILE_PATH, "w") as f:
-                json.dump(new_state, f)
+            encrypted_data = encrypt_data(json.dumps(new_state))
+            with open(HISTORY_FILE_PATH, "wb") as f:
+                f.write(encrypted_data)
             logger.info("Conversation history saved successfully.")
         except Exception as e:
             logger.error(f"Failed to save conversation history: {e}")
@@ -459,7 +591,7 @@ async def chat_handler(message, file_obj, state, internal_reasoning, model_name,
     except Exception as e:
         logger.error(f"Error in chat_handler: {e}")
         updated_chat.append([original_message, "An error occurred while processing your request. Please try again later."])
-        yield updated_chat, state, ""
+        yield updated_chat, state, "", ""
 
 # ===========================
 # Gradio Interface Implementation
@@ -476,8 +608,40 @@ async def gradio_chat_interface(client):
     with demo:
         gr.Markdown("# 🚀 High-Performance Chat Interface for LM Studio - Enhanced Version")
 
-        chatbot_history = gr.Chatbot(label="Conversation")  # Removed type="messages"
+        # Main Layout
+        with gr.Row():
+            with gr.Column(scale=2):
+                chatbot_history = gr.Chatbot(label="Conversation", height=500)
+                file_input = gr.UploadButton(label="Upload Context File (.txt)", type="binary")
+                
+                with gr.Accordion("Advanced Settings", open=False):
+                    model_selector = gr.Dropdown(
+                        label="Select Model",
+                        choices=["Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf", "Another_Model"],
+                        value="Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf"
+                    )
+                    
+                    temperature_slider = gr.Slider(
+                        label="Temperature (controls randomness)",
+                        minimum=0.1,
+                        maximum=2.0,
+                        step=0.1,
+                        value=1.0
+                    )
+                    
+                    top_p_slider = gr.Slider(
+                        label="Top-p (controls diversity of tokens)",
+                        minimum=0.1,
+                        maximum=1.0,
+                        step=0.1,
+                        value=0.9
+                    )
 
+            with gr.Column(scale=1):
+                embeddings_display = gr.Textbox(label="Embeddings History", interactive=False, lines=20)
+                context_display = gr.Textbox(label="Relevant Context", interactive=False)
+
+        # Additional Controls
         with gr.Row():
             user_input = gr.Textbox(
                 label="Your Message",
@@ -486,41 +650,21 @@ async def gradio_chat_interface(client):
                 scale=4
             )
             send_button = gr.Button("Send", variant="primary", scale=1)
+            stop_button = gr.Button("Stop Generation", variant="secondary", scale=1)
 
-        file_input = gr.UploadButton(label="Upload Context File (.txt)", type="binary")
-        context_display = gr.Textbox(label="Relevant Context", interactive=False)
         internal_reasoning_checkbox = gr.Checkbox(label="Enable Internal Reasoning", value=False)
-
-        # Multi-Model Support
-        model_selector = gr.Dropdown(
-            label="Select Model",
-            choices=["Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf", "Another_Model"],
-            value="Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf"
-        )
-
-        # Advanced Parameter Tuning
-        temperature_slider = gr.Slider(
-            label="Temperature (controls randomness)",
-            minimum=0.1,
-            maximum=2.0,
-            step=0.1,
-            value=1.0
-        )
-        top_p_slider = gr.Slider(
-            label="Top-p (controls diversity of tokens)",
-            minimum=0.1,
-            maximum=1.0,
-            step=0.1,
-            value=0.9
-        )
+        thought_process_textbox = gr.Textbox(label="Thought Process", interactive=False, lines=10)
 
         # Persistent Conversation History
         history_state: Dict[str, List[Dict]] = {"embeddings": [], "messages_history": []}
 
         if os.path.exists(HISTORY_FILE_PATH):
             try:
-                with open(HISTORY_FILE_PATH, "r") as f:
-                    loaded_state = json.load(f)
+                with open(HISTORY_FILE_PATH, "rb") as f:
+                    encrypted_data = f.read()
+                
+                decrypted_data = decrypt_data(encrypted_data)
+                loaded_state = json.loads(decrypted_data)
 
                 # Validate the structure of the loaded state
                 if not isinstance(loaded_state, dict) or \
@@ -536,17 +680,48 @@ async def gradio_chat_interface(client):
                 history_state = {"embeddings": [], "messages_history": []}
 
         embeddings_state = gr.State(history_state)
+        stop_generation_state = gr.State({"stop": False})
+
+        async def stop_button_click():
+            """
+            Handles the stop generation button click.
+            """
+            logger.info("Stop generation button clicked.")
+            stop_generation_state.update({"stop": True})
+            return "", ""
 
         send_button.click(
             chat_handler,
-            inputs=[user_input, file_input, embeddings_state, internal_reasoning_checkbox, model_selector, temperature_slider, top_p_slider, chatbot_history],
-            outputs=[chatbot_history, embeddings_state, context_display]
+            inputs=[user_input, file_input, embeddings_state, internal_reasoning_checkbox, model_selector, temperature_slider, top_p_slider, chatbot_history, context_display, thought_process_textbox, stop_generation_state],
+            outputs=[chatbot_history, embeddings_state, context_display, thought_process_textbox]
         )
 
         user_input.submit(
             chat_handler,
-            inputs=[user_input, file_input, embeddings_state, internal_reasoning_checkbox, model_selector, temperature_slider, top_p_slider, chatbot_history],
-            outputs=[chatbot_history, embeddings_state, context_display]
+            inputs=[user_input, file_input, embeddings_state, internal_reasoning_checkbox, model_selector, temperature_slider, top_p_slider, chatbot_history, context_display, thought_process_textbox, stop_generation_state],
+            outputs=[chatbot_history, embeddings_state, context_display, thought_process_textbox]
+        )
+
+        stop_button.click(
+            stop_button_click,
+            inputs=[stop_generation_state],
+            outputs=[]
+        )
+
+        # Update Embeddings Display
+        def format_embeddings(embeddings):
+            formatted_embeddings = "\n".join([f"Message: {msg['content']}\nEmbedding: {emb[:20]}... (truncated)" for msg, emb in zip(embeddings["messages_history"], embeddings["embeddings"])])
+            return f"<pre>{formatted_embeddings}</pre>"
+
+        async def update_embeddings_display(embeddings_state):
+            formatted_embeddings = format_embeddings(embeddings_state)
+            return formatted_embeddings
+
+        # Attach the embeddings display update to chat_handler
+        chatbot_history.change(
+            update_embeddings_display,
+            inputs=[embeddings_state],
+            outputs=embeddings_display
         )
 
     logger.info("Launching Gradio interface.")
