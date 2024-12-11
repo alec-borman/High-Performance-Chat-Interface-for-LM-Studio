@@ -41,11 +41,11 @@ HTTPX_TIMEOUT = 300  # Reduced timeout
 
 HISTORY_FILE_PATH = "chat_history.json"
 
-CHAT_MODEL = "Qwen2.5.1-Coder-7B-Instruct-IQ2_M.gguf"  # Replace with your desired chat model
+CHAT_MODEL = "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF/Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf"  # Replace with your desired chat model
 EMBEDDING_MODEL = "nomic-embed-text-v1.5.Q8_0.gguf"  # Replace with your desired embedding model
 
 # ===========================
-# In-Memory Knowledge Database (using a class and dataclasses)
+# In-Memory Knowledge Database
 # ===========================
 
 class InMemoryKnowledgeDB:
@@ -53,21 +53,42 @@ class InMemoryKnowledgeDB:
         self.knowledge: List[Tuple[str, np.ndarray]] = []
 
     def add_item(self, text: str, embedding: np.ndarray):
-        """Adds an item to the knowledge database."""
+        """Adds an item to the knowledge base."""
         if not isinstance(embedding, np.ndarray):
             logger.error("Invalid embedding type. Expected numpy array.")
             return
         self.knowledge.append((text, embedding))
 
-    def search(self, query_embedding: np.ndarray, k: int = 3) -> List[Tuple[str, float]]:
-        """Searches for similar items in the knowledge database."""
+    def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Tuple[str, float]]:
+        """
+        Searches for similar items in the knowledge database, with diversity enhancement.
+        Returns top-k items with their similarity scores.
+        """
         if not self.knowledge:
             return []
 
-        similarities = [(text, calculate_similarity(query_embedding, embedding))
-                        for text, embedding in self.knowledge]
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:k]
+        similarities = []
+        for text, embedding in self.knowledge:
+            similarity = calculate_similarity(query_embedding, embedding)
+            similarities.append((text, embedding, similarity))  # Include embedding for diversity check
+
+        similarities.sort(key=lambda x: x[2], reverse=True)
+
+        # Select top k items, ensuring diversity
+        selected = []
+        for text, embedding, score in similarities:
+            is_diverse = True
+            for selected_text, selected_embedding, _ in selected:
+                # Check if the current item is too similar to already selected items
+                if calculate_similarity(embedding, selected_embedding) > 0.9:  # Diversity threshold
+                    is_diverse = False
+                    break
+            if is_diverse:
+                selected.append((text, embedding, score))
+            if len(selected) == k:
+                break
+
+        return [(text, score) for text, _, score in selected]
 
 knowledge_db = InMemoryKnowledgeDB()
 
@@ -81,7 +102,7 @@ def calculate_max_tokens(message_history_length: int, model_max_tokens: int = MO
                         min_output_tokens: int = MIN_OUTPUT_TOKENS) -> int:
     """
     Calculates the maximum number of tokens for the output, prioritizing output length.
-    
+
     This function now prioritizes having at least min_output_tokens available for the
     response. It dynamically adjusts the context window if necessary to accommodate this
     requirement.
@@ -121,43 +142,49 @@ async def get_embeddings(text: str) -> Optional[np.ndarray]:
 
     embeddings = []
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
-        for chunk in chunks:
-            payload = {"model": EMBEDDING_MODEL, "input": [chunk]}
-            try:
-                response = await client.post(f"{BASE_URL}/embeddings", json=payload)
-                response.raise_for_status()
-                data = response.json()
-                embedding = np.array(data["data"][0]["embedding"], dtype=np.float32)
-                if not isinstance(embedding, np.ndarray):
-                    logger.error("Invalid embedding returned from API.")
-                    return None
-                embeddings.append(embedding)
-            except httpx.HTTPError as e:
-                logger.error(f"HTTP error while getting embeddings: {e}")
-                return None
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decoding error while getting embeddings: {e}")
-                return None
-
-    return np.concatenate(embeddings) if embeddings else None
+      for chunk in chunks:
+          payload = {"model": EMBEDDING_MODEL, "input": [chunk]}
+          try:
+              response = await client.post(f"{BASE_URL}/embeddings", json=payload)
+              response.raise_for_status()
+              data = response.json()
+              embedding = np.array(data["data"][0]["embedding"], dtype=np.float32)
+              embeddings.append(embedding)
+          except httpx.HTTPError as e:
+              logger.error(f"HTTP error while getting embeddings: {e}")
+              return None
+          except json.JSONDecodeError as e:
+              logger.error(f"JSON decoding error while getting embeddings: {e}")
+              return None
+    
+    # Instead of combining, return the list of embeddings
+    return embeddings if embeddings else None
 
 def calculate_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    """Calculates cosine similarity between two vectors."""
+    """Calculates cosine similarity between two vectors, handling None values."""
     if vec1 is None or vec2 is None:
         logger.warning("One or both vectors are None. Returning similarity as 0.0.")
         return 0.0
-    try:
-        dot_product = np.dot(vec1, vec2)
-        norm_vec1 = np.linalg.norm(vec1)
-        norm_vec2 = np.linalg.norm(vec2)
-        if norm_vec1 == 0 or norm_vec2 == 0:
-            logger.warning("Norm of one vector is zero. Returning similarity as 0.0.")
-            return 0.0
-        similarity = dot_product / (norm_vec1 * norm_vec2)
-        return similarity
-    except Exception as e:
-        logger.error(f"Error calculating similarity: {e}")
+
+    # Ensure the vectors have the same dimensions
+    if vec1.shape != vec2.shape:
+        logger.error("Vectors have different dimensions. Returning similarity as 0.0.")
         return 0.0
+
+    # Flatten the vectors to 1D arrays
+    vec1 = vec1.flatten()
+    vec2 = vec2.flatten()
+
+    dot_product = np.dot(vec1, vec2)
+    norm_vec1 = np.linalg.norm(vec1)
+    norm_vec2 = np.linalg.norm(vec2)
+
+    if norm_vec1 == 0 or norm_vec2 == 0:
+        logger.warning("Norm of one vector is zero. Returning similarity as 0.0.")
+        return 0.0
+
+    similarity = dot_product / (norm_vec1 * norm_vec2)
+    return similarity
 
 # ===========================
 # Internal Reasoning (Enhanced with more steps)
@@ -174,9 +201,10 @@ async def generate_internal_reasoning_steps(message: str) -> List[str]:
             logger.warning("Attempted to generate reasoning steps for empty message.")
             return []
 
-        user_embedding = await get_embeddings(message)
-        if user_embedding is None:
-            logger.error("Failed to generate embeddings for the message.")
+        # Generate embeddings for the full message
+        full_message_embedding = await get_embeddings(message)
+        if full_message_embedding is None:
+            logger.error("Failed to generate embeddings for the full message.")
             return []
 
         steps = [
@@ -193,16 +221,19 @@ async def generate_internal_reasoning_steps(message: str) -> List[str]:
 
         steps.append("Step 3: Retrieving relevant knowledge for each sub-component.")
         for i, component in enumerate(sub_components):
-            component_embedding = await get_embeddings(component)
-            if component_embedding is not None:
-                similar_items = knowledge_db.search(component_embedding)
-                if similar_items:
-                    best_match, score = similar_items[0]
-                    steps.append(f"  For sub-component {i + 1}, retrieved knowledge: '{best_match[:50]}...' (similarity: {score:.2f})")
-                else:
-                    steps.append(f"  For sub-component {i + 1}, no relevant knowledge found.")
+            component_embeddings = await get_embeddings(component)
+            
+            if component_embeddings is not None:
+              # Treat each embedding as a separate query to the knowledge base
+              for embedding in component_embeddings:
+                  similar_items = knowledge_db.search(embedding)
+                  if similar_items:
+                      best_match, score = similar_items[0]
+                      steps.append(f"  For sub-component {i + 1}, retrieved knowledge: '{best_match[:50]}...' (similarity: {score:.2f})")
+                  else:
+                      steps.append(f"  For sub-component {i + 1}, no relevant knowledge found.")
             else:
-                logger.error(f"Could not generate embeddings for sub-component {i+1}")
+              logger.error(f"Could not generate embeddings for sub-component {i + 1}")
 
         steps.append("Step 4: Synthesizing an overall response based on the retrieved knowledge and the original query.")
         
@@ -224,34 +255,32 @@ async def chat_with_lmstudio(messages: List[Dict], model_name: str = CHAT_MODEL,
     payload = {"model": model_name, "messages": messages, "temperature": temperature, "top_p": top_p, "max_tokens": max_tokens, "stream": True}
 
     async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
-        try:
-            logger.info("Sending chat completion request to LM Studio API.")
-            async with client.stream("POST", url, json=payload) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if line.strip() == "data: [DONE]":
-                        logger.info("Received [DONE] signal from LM Studio.")
-                        break
-                    elif line.startswith("data:"):
-                        data = json.loads(line[6:])
-                        content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                        if content:
-                            logger.debug(f"Received response chunk: {content[:50]}...")
-                            yield content
-                    else:
-                        logger.warning("Received unexpected line in chat completion streaming.")
-        except httpx.ReadTimeout:
-            logger.error("Timeout error during chat completion streaming.")
-            yield "The operation timed out. Please try again."
-        except httpx.HTTPError as e:
-            logger.error(f"HTTP error during chat completion streaming: {e}")
-            yield "An HTTP error occurred. Please check the server status and logs."
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decoding error during chat completion streaming: {e}")
-            yield "An error occurred while decoding the server's response. Please check the server logs."
-        except Exception as e:
-            logger.error(f"Unexpected error during chat completion streaming: {e}")
-            yield "An unexpected error occurred. Please try again later."
+      try:
+          logger.info("Sending chat completion request to LM Studio API.")
+          async with client.stream("POST", url, json=payload) as response:
+              response.raise_for_status()
+              async for line in response.aiter_lines():
+                  if line.strip() == "data: [DONE]":
+                      logger.info("Received [DONE] signal from LM Studio.")
+                      break
+                  elif line.startswith("data:"):
+                      data = json.loads(line[6:])
+                      content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                      if content:
+                          logger.debug(f"Received response chunk: {content[:50]}...")
+                          yield content
+      except httpx.ReadTimeout:
+          logger.error("Timeout error during chat completion streaming.")
+          yield "The operation timed out. Please try again."
+      except httpx.HTTPError as e:
+          logger.error(f"HTTP error during chat completion streaming: {e}")
+          yield "An HTTP error occurred. Please check the server status and logs."
+      except json.JSONDecodeError as e:
+          logger.error(f"JSON decoding error during chat completion streaming: {e}")
+          yield "An error occurred while decoding the server's response. Please check the server logs."
+      except Exception as e:
+          logger.error(f"Unexpected error during chat completion streaming: {e}")
+          yield "An unexpected error occurred. Please try again later."
 
 # ===========================
 # Chat Handler
@@ -260,7 +289,6 @@ async def chat_with_lmstudio(messages: List[Dict], model_name: str = CHAT_MODEL,
 async def chat_handler(message: str, file_obj: Optional[object], state: Dict, internal_reasoning: bool,
                        model_name: str, temperature: float, top_p: float, chatbot_history: List[List],
                        context_display: str, reasoning_steps_display: str) -> Tuple[List[List], Dict, str, str]:
-    """Handles the user message processing and response generation."""
     logger.info("Handling new user message.")
 
     try:
@@ -273,12 +301,11 @@ async def chat_handler(message: str, file_obj: Optional[object], state: Dict, in
         messages_history = state.get("messages_history", [])
         updated_chat = chatbot_history.copy() if chatbot_history else []
 
-        # Handle file uploads
         if file_obj is not None:
             try:
                 if not file_obj.orig_name.lower().endswith(".txt"):
                     raise ValueError("Invalid file type. Only .txt files are allowed.")
-            
+
                 logger.info(f"Processing uploaded file: {file_obj.orig_name}")
                 file_content = file_obj.read().decode("utf-8")
                 message += f"\n[File Content]:\n{file_content}"
@@ -302,54 +329,52 @@ async def chat_handler(message: str, file_obj: Optional[object], state: Dict, in
                 return
 
         # Generate embeddings for the user message
-        user_embedding = await get_embeddings(message)
-        if user_embedding is not None:
-            logger.info("Embedding generated for user message.")
-            embeddings.append(user_embedding.tolist())  # Convert to list for JSON serialization
-            messages_history.append({"role": "user", "content": original_message})
+        user_embeddings = await get_embeddings(message)
+        if user_embeddings is not None:
+            logger.info("Embeddings generated for user message.")
+            # Store each embedding individually
+            for embedding in user_embeddings:
+                embeddings.append(embedding.tolist())  # Convert to list for JSON serialization
+                messages_history.append({"role": "user", "content": original_message})
         else:
             updated_chat.append([original_message, "Failed to generate embeddings."])
             yield updated_chat, state, "", ""
             return
 
-        # Trim embeddings and message history if necessary
         if len(embeddings) > MAX_EMBEDDINGS:
             logger.info("Trimming embeddings and message history.")
             embeddings = embeddings[-MAX_EMBEDDINGS:]
             messages_history = messages_history[-MAX_EMBEDDINGS:]
 
-        # Retrieve relevant context from knowledge base
         history = [*messages_history]
         context_text = ""
 
         if len(embeddings) > 1:
             logger.info("Retrieving relevant context from knowledge base.")
-            similar_items = knowledge_db.search(user_embedding, k=3)
+            # Use the latest user embedding for context retrieval
+            latest_user_embedding = user_embeddings[-1]  # Use the last embedding
+            similar_items = knowledge_db.search(latest_user_embedding, k=3)
             for item, similarity in similar_items:
                 context_text += f"Context: {item[:200]}... (Similarity: {similarity:.2f})\n"
             if similar_items:
                 best_match, _ = similar_items[0]
                 history.insert(0, {"role": "system", "content": best_match})
 
-        # Calculate the maximum number of tokens for the output
         total_message_history_length = sum(len(msg["content"]) for msg in messages_history)
         max_tokens = calculate_max_tokens(total_message_history_length)
 
         response = ""
         updated_chat.append([original_message, None])
 
-        # Generate internal reasoning steps if enabled
         reasoning_text = ""
         if internal_reasoning:
-            reasoning_steps = await generate_internal_reasoning_steps(original_message)
+            reasoning_steps = await generate_internal_reasoning_steps( original_message)
             reasoning_text = "\n".join(reasoning_steps)
 
         history.append({"role": "user", "content": original_message})
-        
-        # Send chat request to LM Studio API
         try:
             logger.info("Sending chat request to LM Studio.")
-            async for chunk in chat_with_lmstudio(history, model_name, temperature, top_p, max_tokens):
+            async for chunk in chat_with_lmstudio( history, model_name, temperature, top_p, max_tokens):
                 response += chunk
                 updated_chat[-1] = [original_message, response]
                 yield updated_chat, {"embeddings": embeddings, "messages_history": messages_history}, context_text, reasoning_text
@@ -360,11 +385,9 @@ async def chat_handler(message: str, file_obj: Optional[object], state: Dict, in
             yield updated_chat, state, "", ""
             return
 
-        # Append the assistant's response to message history
         messages_history.append({"role": "assistant", "content": response})
         new_state = {"embeddings": embeddings, "messages_history": messages_history}
 
-        # Save conversation history to file
         try:
             with open(HISTORY_FILE_PATH, "w") as f:
                 json.dump(new_state, f)
@@ -386,8 +409,8 @@ async def chat_handler(message: str, file_obj: Optional[object], state: Dict, in
 async def gradio_chat_interface():
     """Creates and launches the Gradio Blocks interface."""
     demo = gr.Blocks(title="LM Studio Chat Interface - Enhanced Version")
-    
-    with demo:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(HTTPX_TIMEOUT)) as client:
+      with demo:
         gr.Markdown("# 🚀 High-Performance Chat Interface for LM Studio - Enhanced Version")
 
         with gr.Row():
@@ -436,7 +459,6 @@ async def gradio_chat_interface():
         history_state = load_history()
         embeddings_state = gr.State(history_state)
 
-        # Connect event handlers to chat_handler
         send_button.click(
             chat_handler,
             inputs=[user_input, file_input, embeddings_state, internal_reasoning_checkbox, model_selector, temperature_slider, top_p_slider, chatbot_history, context_display, reasoning_steps_display],
@@ -462,7 +484,6 @@ async def gradio_chat_interface():
             formatted_embeddings = format_embeddings(embeddings_state)
             return formatted_embeddings
 
-        # Connect chatbot_history change to update_embeddings_display
         chatbot_history.change(
             update_embeddings_display,
             inputs=[embeddings_state],
@@ -471,10 +492,6 @@ async def gradio_chat_interface():
 
         logger.info("Launching Gradio interface.")
         await demo.queue().launch(share=True, server_name="0.0.0.0", server_port=7860)
-
-# ===========================
-# Loading History
-# ===========================
 
 def load_history() -> Dict:
     """Loads conversation history from a file or returns an empty history if the file does not exist or is invalid."""
@@ -519,12 +536,10 @@ def load_history() -> Dict:
 if __name__ == "__main__":
     logger.info("Starting main execution.")
     try:
-        # Add initial knowledge items to the database
         knowledge_db.add_item("Pandas can be used to read CSV files.", np.random.rand(768).astype(np.float32))
         knowledge_db.add_item("Matplotlib can create bar charts.", np.random.rand(768).astype(np.float32))
         knowledge_db.add_item("The average can be calculated by grouping data in Pandas.", np.random.rand(768).astype(np.float32))
 
-        # Launch the Gradio interface
         asyncio.run(gradio_chat_interface())
     except Exception as e:
         logger.exception(f"An error occurred: {e}")
