@@ -1,43 +1,44 @@
-# 🚀 High-Performance Chat Interface for LM Studio – Enhanced Version
+# 🚀 High-Performance Chat Interface for LM Studio
 
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 ## Overview
 
-This repository provides a **powerful and efficient web-based chat application** designed for seamless interaction with AI language models hosted on **LM Studio**. This application leverages **GPU acceleration** (where available) and **asynchronous operations** to deliver a highly responsive and performant user experience.
+This repository provides a **powerful and efficient web-based chat application** designed for seamless interaction with AI language models hosted on **LM Studio**. This application is optimized for **GPU acceleration** (when available) and uses **asynchronous operations** to ensure a highly responsive and performant user experience.
 
-This enhanced version incorporates several advanced features, including a sophisticated **internal reasoning system**, **dynamic token management**, and **context handling** using embeddings. Notably, this project is implemented as a **self-contained, single-file Python script** for ease of use and deployment.
+This version incorporates several advanced features, including an **iterative chain-of-thought reasoning system**, **dynamic token management**, and **context handling** using a knowledge graph and in-memory GPU vector database. Notably, this project is implemented as a **self-contained, single-file Python script** for ease of use and deployment.
 
 ## ✨ Key Features
 
--   **LM Studio Integration:** Connects directly to your local LM Studio server to access a variety of large language models (LLMs).
--   **Real-time Interaction:** Built on the Gradio framework for a dynamic and interactive chat experience.
--   **Contextual Conversations:** Maintains conversation history and utilizes embeddings to provide contextually relevant responses.
--   **GPU Acceleration:** Automatically detects and utilizes available GPU resources for faster processing.
+-   **LM Studio Integration:** Connects directly to your local LM Studio server to access various large language models (LLMs).
+-   **Real-time Interaction:** Built using the Gradio framework for a dynamic and interactive chat experience.
+-   **Contextual Conversations:** Maintains conversation history and utilizes a knowledge graph and embeddings to provide contextually relevant responses.
+-   **GPU Acceleration:** Automatically detects and utilizes available GPU resources for faster processing with Pytorch tensors.
 -   **Asynchronous Operations:** Employs `async` and `await` to ensure non-blocking API calls, leading to a more responsive user interface.
--   **Dynamic Token Handling:** Intelligently calculates the maximum number of tokens for responses, prioritizing a minimum output length of 8000 tokens while respecting model limitations.
--   **Internal Reasoning Mechanism:**
-    -   **Problem Decomposition:** Breaks down user queries into smaller sub-components using regular expressions.
-    -   **Embedding Generation:** Generates embeddings for each sub-component using a dedicated embedding model.
-    -   **Knowledge Retrieval:** Searches an in-memory knowledge base for relevant information using cosine similarity between embeddings.
-    -   **Response Synthesis:** Combines retrieved knowledge, the original query, and generated reasoning steps to produce a comprehensive and informed response.
--   **In-Memory Knowledge Base:** Stores and retrieves text snippets with their embeddings to enhance context awareness.
--   **File Upload:** Enables users to upload `.txt` files, providing additional context to the chatbot.
+-   **Dynamic Token Handling:** Intelligently calculates the maximum number of tokens for responses, prioritizing a minimum output length while respecting model limitations.
+-   **Iterative Chain-of-Thought Reasoning:**
+    -   **Detailed Reasoning:** Generates responses based on a step-by-step reasoning process.
+    -   **Verification Loop:** Iteratively refines reasoning using self-verification techniques (placeholder for more advanced verification).
+-   **Knowledge Graph Context:** Uses a Neo4j database to store interconnected information, enabling richer contextual understanding.
+-   **In-Memory GPU Vector Database**: Stores and retrieves text snippets with their embeddings in GPU memory to enhance context awareness.
 -   **Persistent Conversation History:** Saves and loads conversation history (including embeddings) to a JSON file (`chat_history.json`), allowing for continuous conversations across sessions.
--   **Robust Error Handling:** Includes comprehensive error handling for various scenarios, such as API errors, file handling issues, and JSON parsing errors, providing informative feedback to the user.
+-   **Bias Detection**: Implements a basic bias detection system using a pre-trained model.
+-   **Robust Error Handling:** Includes comprehensive error handling for various scenarios, such as API errors, and JSON parsing errors, providing informative feedback to the user.
 -   **Streamlined and Efficient:** Optimized for performance and memory usage.
 -   **Real-Time Updates:** The Gradio interface updates dynamically as the response is generated.
--   **Simplified Configuration:** Easily configurable using constants and environment variables.
+-   **Simplified Configuration:** Easily configurable using environment variables.
 
-## 	📚 Table of Contents
+## 📚 Table of Contents
 
 -   [Installation](#-installation)
     -   [Prerequisites](#-prerequisites)
     -   [Setup Steps](#-setup-steps)
 -   [Usage](#-usage)
 -   [Configuration](#-configuration)
--   [Internal Reasoning System](#-internal-reasoning-system)
--   [In-Memory Knowledge Base](#-in-memory-knowledge-base)
+-   [Iterative Chain-of-Thought Reasoning System](#-iterative-chain-of-thought-reasoning-system)
+-   [In-Memory GPU Vector Database](#-in-memory-gpu-vector-database)
+-   [Knowledge Graph Context](#-knowledge-graph-context)
+-    [Bias Detection](#-bias-detection)
 -   [Error Handling](#-error-handling)
 -   [Contributing](#-contributing)
 -   [License](#-license)
@@ -52,10 +53,12 @@ This enhanced version incorporates several advanced features, including a sophis
 
 -   **Python 3.8 or higher**
 -   **LM Studio:** A running instance of LM Studio with the following models loaded:
-    -   **Chat Model:**  `bartowski/Qwen2.5-Coder-32B-Instruct-GGUF/Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf` (or your preferred model).
-    -   **Embedding Model:** `nomic-embed-text-v1.5.Q8_0.gguf`
+    -   **Chat Model:** `Qwen/Qwen2.5-Coder-32B-Instruct` (or your preferred Qwen Coder based model).
+    -   **Embedding Model:** `nomic-ai/nomic-embed-text-v1.5`
 
-### 	✅ Setup Steps
+-   **Neo4j Database**: A running instance of the Neo4j graph database accessible from your machine.
+
+### ✅ Setup Steps
 
 1. **Clone this repository:**
 
@@ -69,17 +72,15 @@ This enhanced version incorporates several advanced features, including a sophis
 2. **Install the required libraries:**
 
     ```bash
-    pip install gradio httpx numpy torch
+    pip install httpx numpy torch torchvision torchaudio transformers gradio chromadb scikit-learn neo4j-driver python-dotenv aiolimiter
     ```
 
-3. **(Optional) Set the environment variable:**
+3. **(Optional) Set the environment variables:**
 
-    ```bash
-    export LMSTUDIO_API_BASE_URL="http://localhost:1234/v1"
-    ```
-
+   - Configure your API access and Neo4j settings using a `.env` file.
     -   If your LM Studio server is running on a different host or port, adjust the `LMSTUDIO_API_BASE_URL` accordingly.
-    -   If you don't set this environment variable, the code will default to `http://localhost:1234/v1`.
+    -   If your Neo4j database is running on a different host or port, adjust `NEO4J_URI`, `NEO4J_USER`, and `NEO4J_PASSWORD`.
+   -   If you don't set these environment variable, the code will default to `http://localhost:1234/v1` for the LM studio API, and `bolt://localhost:7687` with user `neo4j` and password `password` for Neo4j.
 
 ## 🕹️ Usage
 
@@ -91,64 +92,77 @@ This enhanced version incorporates several advanced features, including a sophis
 
 2. **Access the interface:**
 
-    -   Open your web browser and go to `http://0.0.0.0:7860/` (or the URL indicated in the console output).
-    -   If you use Gradio's `share=True` option, a temporary public URL will be provided.
+    -   Open your web browser and go to the URL provided by Gradio in the console output.
 
 3. **Interact with the chatbot:**
 
     -   Type your message into the **"Your Message"** text box.
-    -   (Optional) Upload a `.txt` file using the **"Upload Context File"** button to provide additional context.
     -   Click **"Send"** or press **Enter** to send the message.
     -   The chatbot will respond in the **"Conversation"** area.
     -   View the **"Relevant Context"** and **"Reasoning Steps"** to see how the model is processing your input.
-    -   The **"Embeddings History"** shows a preview of the embeddings generated for recent messages.
 
-4. **Advanced Settings:**
+4.  **Advanced Settings:**
 
     -   Click on **"Advanced Settings"** to access the following options:
         -   **Select Model:** Choose a different chat model (if available in your LM Studio setup).
         -   **Temperature:** Adjust the randomness of the model's output (higher values = more creative, lower values = more deterministic).
         -   **Top-p:** Control the diversity of the generated tokens (lower values = more focused on the most likely tokens).
+        -   **Minimum Output Tokens:** Controls the minimum length of the output from the model.
         -   **Enable Internal Reasoning:** Toggle the internal reasoning system on or off.
 
 ## ⚙️ Configuration
 
 The following constants and environment variables can be used to configure the application:
 
-| Constant                     | Description                                                                                                                                                                                                           | Default Value            |
-| :--------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------- |
-| `BASE_URL`                   | The base URL of your LM Studio API. (Can also be set via the `LMSTUDIO_API_BASE_URL` environment variable.)                                                                                                         | `"http://localhost:1234/v1"` |
-| `USE_GPU`                    | Automatically set to `True` if a GPU is available, `False` otherwise.                                                                                                                                                | `True` if GPU available |
-| `MODEL_MAX_TOKENS`           | The maximum number of tokens your chat model can handle.                                                                                                                                                             | `32768`                  |
-| `EMBEDDING_MODEL_MAX_TOKENS` | The maximum number of tokens for embedding generation.                                                                                                                                                                 | `8192`                   |
-| `AVERAGE_CHARS_PER_TOKEN`    | An estimate of the average number of characters per token.                                                                                                                                                           | `4`                      |
-| `BUFFER_TOKENS`             | A buffer to reserve tokens for internal use.                                                                                                                                                                        | `1500`                   |
-| `MIN_OUTPUT_TOKENS`          | The minimum number of tokens for the generated response (set to 8000 in this version).                                                                                                                               | `8000`                   |
-| `MAX_EMBEDDINGS`             | The maximum number of embeddings to store in memory.                                                                                                                                                                  | `100`                    |
-| `HTTPX_TIMEOUT`              | The timeout (in seconds) for HTTP requests to the LM Studio API.                                                                                                                                                      | `300`                    |
-| `HISTORY_FILE_PATH`          | The path to the file where conversation history is saved.                                                                                                                                                           | `"chat_history.json"`    |
-| `CHAT_MODEL`                 | The name of the chat model to use (must be loaded in LM Studio).                                                                                                                                                        | Specific to your setup  |
-| `EMBEDDING_MODEL`           | The name of the embedding model to use (must be loaded in LM Studio).                                                                                                                                                  | Specific to your setup  |
+| Constant                     | Description                                                                                                                                                                                                 | Default Value                   |
+| :--------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------ |
+| `BASE_URL`                   | The base URL of your LM Studio API. (Can also be set via the `LMSTUDIO_API_BASE_URL` environment variable.)                                                                                                   | `"http://localhost:1234/v1"`     |
+| `USE_GPU`                    | Automatically set to `True` if a GPU is available, `False` otherwise.                                                                                                                                       | `True` if GPU available        |
+| `MODEL_MAX_TOKENS`           | The maximum number of tokens your chat model can handle.                                                                                                                                                         | `32768`                        |
+| `EMBEDDING_MODEL_MAX_TOKENS` | The maximum number of tokens for embedding generation.                                                                                                                                                         | `8192`                         |
+| `BUFFER_TOKENS`              | A buffer to reserve tokens for internal use.                                                                                                                                                                 | `1500`                          |
+| `MIN_OUTPUT_TOKENS`           | The minimum number of tokens for the generated response (set to 8000 in this version).                                                                                                                              | `8000`                          |
+| `MAX_EMBEDDINGS`              | The maximum number of embeddings to store in memory.                                                                                                                                                                  | `100`                           |
+| `HTTPX_TIMEOUT`              | The timeout (in seconds) for HTTP requests to the LM Studio API.                                                                                                                                                     | `300`                           |
+| `HISTORY_FILE_PATH`          | The path to the file where conversation history is saved.                                                                                                                                                        | `"chat_history.json"`           |
+| `CHAT_MODEL`                 | The name of the chat model to use (must be loaded in LM Studio).                                                                                                                                                     | Specific to your setup      |
+| `EMBEDDING_MODEL`            | The name of the embedding model to use (must be loaded in LM Studio).                                                                                                                                               | Specific to your setup       |
+|`NEO4J_URI`             | The URI of your Neo4j database.                                                                                                                                                              |  `bolt://localhost:7687`  |
+|`NEO4J_USER`            | The username for your Neo4j database.                                                                                                                                                                      | `"neo4j"`  |
+|`NEO4J_PASSWORD`         | The password for your Neo4j database.                                                                                                                                                                       | `"password"`  |
+| `EMBEDDING_DIMS`  | The dimensionality of the embeddings. Make sure it matches the embedding model output dimension. | `768`
 
-## 🧠 Internal Reasoning System
+## 🧠 Iterative Chain-of-Thought Reasoning System
 
-The internal reasoning system enhances the chatbot's ability to understand and respond to complex queries. It works as follows:
+The iterative chain-of-thought reasoning system enhances the chatbot's ability to respond to complex queries by:
 
-1. **Embedding Generation:** When a user sends a message, the system generates embeddings for the message using the specified embedding model.
-2. **Problem Decomposition:** The system attempts to break down the user's message into smaller sub-components using regular expression patterns. This helps identify potential actions or sub-problems within the query.
-3. **Knowledge Retrieval:** For each sub-component, the system searches the in-memory knowledge base for relevant information. The search is performed using cosine similarity between the sub-component's embedding and the embeddings of items in the knowledge base.
-4. **Context Selection:** The most relevant knowledge items (based on similarity scores) are selected as context for the LM Studio model.
-5. **Reasoning Steps Generation:** The system generates a series of internal reasoning steps that describe the analysis, decomposition, and knowledge retrieval process. These steps are displayed in the "Reasoning Steps" section of the Gradio interface, providing transparency into the model's thought process.
-6. **Response Synthesis:** Finally, the system combines the original user message, the selected context, and the reasoning steps to generate a comprehensive and informed response using the LM Studio chat completion API.
+1.  **Step-by-Step Reasoning:** The system uses the LLM to generate a step-by-step reasoning process before producing the final answer.
+2.  **Iterative Refinement:** The system can iteratively refine the reasoning steps using self-verification techniques (currently a placeholder, but designed for future enhancement).
+3.  **Transparency:** The generated reasoning steps are displayed to the user, providing insights into the model's thought process.
 
-## 💾 In-Memory Knowledge Base
+## 💾 In-Memory GPU Vector Database
 
-The `InMemoryKnowledgeDB` class provides a simple in-memory knowledge base for storing and retrieving text snippets and their corresponding embeddings.
+The `InMemoryGPUVectorDB` class provides an in-memory vector database which performs computations on the GPU using PyTorch tensors.
 
--   **`add_item(text, embedding)`:** Adds a text snippet and its embedding to the knowledge base.
--   **`search(query_embedding, k=3)`:** Searches the knowledge base for the `k` most similar items to the given `query_embedding` using cosine similarity. Returns a list of tuples, where each tuple contains the text snippet and its similarity score.
+-   **`add_item(text, metadata=None)`:** Adds a text snippet and its embedding to the database, calculated and stored as a PyTorch tensor.
+-   **`search(query_text, k=3, diversity_factor=0.5)`:** Searches the database for the `k` most similar items to the given `query_text` using cosine similarity. MMR is used to diversify the results. Returns a list of tuples, where each tuple contains the text snippet and its similarity score.
 
 **Note:** This in-memory knowledge base is suitable for small to medium-sized datasets. For larger datasets, consider using a more scalable database solution.
+
+## 🕸️ Knowledge Graph Context
+
+The application integrates with a Neo4j database to retrieve context using a knowledge graph-based approach. The steps are:
+- Get embedding of user query.
+- Retrieve relevant nodes from the Neo4j graph database.
+- Return results as context for the LLM.
+To add items to the graph, use the `add_item` method in the `KnowledgeGraphRetriever` class.
+
+## ⚖️ Bias Detection
+
+The application includes a basic bias detection feature:
+-   Uses a Hugging Face Transformer model to analyze the response.
+-  If the response has a bias score greater than 0.65 (arbitrary), then it will warn the user.
+- This component is a placeholder and would require more thought in a production system.
 
 ## ❗ Error Handling
 
@@ -166,8 +180,8 @@ Error messages are logged to the console and displayed in the Gradio interface t
 
 Contributions to this project are welcome! Please follow these steps:
 
-1. Fork the repository.
-2. Create a new branch for your feature or bug fix:
+1.  Fork the repository.
+2.  Create a new branch for your feature or bug fix:
     ```bash
     git checkout -b feature/your-feature-name
     ```
@@ -175,9 +189,9 @@ Contributions to this project are welcome! Please follow these steps:
     ```bash
     git checkout -b bugfix/issue-description
     ```
-3. Make your changes and commit them with clear, descriptive commit messages.
-4. Push your branch to your forked repository.
-5. Create a pull request to the `main` branch of the original repository.
+3.  Make your changes and commit them with clear, descriptive commit messages.
+4.  Push your branch to your forked repository.
+5.  Create a pull request to the `main` branch of the original repository.
 
 Please ensure your code adheres to the existing code style and includes appropriate comments and documentation.
 
@@ -211,7 +225,10 @@ You can deploy this Gradio application to Hugging Face Spaces for easy sharing a
      httpx
      numpy
      torch
-     ```
+     transformers
+     aiolimiter
+     neo4j-driver
+    ```
 5. **Commit and Push Changes:**
    - Commit your changes:
      ```bash
@@ -239,18 +256,20 @@ A: LM Studio is a platform for hosting and interacting with various AI language 
 
 **Q: What models are supported?**
 
-A: This application can work with any language model hosted on LM Studio that supports the chat completions endpoint. The provided code specifically mentions the `bartowski/Qwen2.5-Coder-32B-Instruct-GGUF/Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf` and `nomic-embed-text-v1.5.Q8_0.gguf` models, but you can easily modify the `CHAT_MODEL` and `EMBEDDING_MODEL` constants to use other models.
+A: This application is optimized for the `Qwen/Qwen2.5-Coder-32B-Instruct` model, but should work with any models supported by LM Studio's chat completion API. You will need to modify the `CHAT_MODEL` and `EMBEDDING_MODEL_HUGGING_FACE_NAME` constants in the code to use other models.
 
 **Q: How do I add knowledge to the in-memory knowledge base?**
 
-A: The example code adds a few sample knowledge items in the `if __name__ == "__main__":` block. You can add more items by calling the `knowledge_db.add_item(text, embedding)` function, where `text` is the text snippet and `embedding` is the corresponding embedding (a NumPy array) generated using the `get_embeddings` function.
+A: The example code adds a few sample knowledge items in the `if __name__ == "__main__":` block. You can add more items by calling the `vector_db.add_item(text)` function, where `text` is the text snippet.
 
 **Q: How can I improve the performance of the application?**
 
 A: Here are some tips for improving performance:
 
--   **Use a GPU:** If you have a compatible GPU, make sure `USE_GPU` is set to `True` to enable GPU acceleration.
--   **Optimize Embeddings:** Experiment with different embedding models to find one that provides good performance for your use case.
--   **Reduce Context Size:** If the conversation history becomes very long, consider truncating it or summarizing older parts of the conversation to reduce the number of tokens sent to the model.
--   **Increase `MIN_OUTPUT_TOKENS`:** If the model is consistently generating very short responses, try increasing `MIN_OUTPUT_TOKENS` to encourage longer outputs.
--   **Use a Scalable Database:** For large knowledge bases, consider using a persistent database instead of the in-memory knowledge base.
+-  Make sure you have a compatible GPU installed and that torch is utilizing it for computation.
+-   Consider a scalable database instead of the in-memory knowledge base for larger datasets.
+-   Tune parameters for prompt generation and model interaction to speed up responses.
+
+## 📞 Contact
+
+If you have any questions or need further assistance, feel free to reach out by opening an issue or submitting a pull request to the repository.
