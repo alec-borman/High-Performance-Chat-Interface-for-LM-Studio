@@ -1,396 +1,577 @@
-
-import gradio as gr
-import httpx
-import json
 import os
-import numpy as np
-import torch
+import json
 import asyncio
 import logging
+import httpx
+import numpy as np
+import torch
 from functools import lru_cache
-from typing import Optional, Dict, List, Tuple, AsyncGenerator
+from typing import Optional, Dict, List, Tuple, AsyncGenerator, Protocol, Any
+from transformers import AutoTokenizer, AutoModel
+import gradio as gr
+import time
+import secrets
+import hashlib
+import torch.nn as nn
+from dotenv import load_dotenv
+from aiolimiter import AsyncLimiter
+from neo4j import GraphDatabase
+from chromadb.utils import embedding_functions
+import html
 import re
+
+load_dotenv()
 
 # ===========================
 # Logging Configuration
 # ===========================
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
+logger = logging.getLogger("HighPerfChatbot")
 
 # ===========================
 # Configuration and Constants
 # ===========================
-
-BASE_URL = os.getenv("LMSTUDIO_API_BASE_URL", "http://localhost:1234/v1")
-if not BASE_URL.startswith("http"):
-    logger.error(f"Invalid BASE_URL: {BASE_URL}. Must start with 'http'.")
-    raise ValueError("Invalid BASE_URL. Must start with 'http'.")
-
-USE_GPU = torch.cuda.is_available()
-DEVICE = torch.device("cuda" if USE_GPU else "cpu")
-logger.info(f"GPU Available: {USE_GPU}, Device: {DEVICE}")
-
-MODEL_MAX_TOKENS = 32768
-EMBEDDING_MODEL_MAX_TOKENS = 8192
-AVERAGE_CHARS_PER_TOKEN = 4
-BUFFER_TOKENS = 1500
-MIN_OUTPUT_TOKENS = 8000  # Minimum output tokens
-
-MAX_EMBEDDINGS = 100
-HTTPX_TIMEOUT = 300  # Reduced timeout
-
-HISTORY_FILE_PATH = "chat_history.json"
-
-CHAT_MODEL = "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF/Qwen2.5-Coder-32B-Instruct-IQ2_M.gguf"  # Replace with your desired chat model
-EMBEDDING_MODEL = "nomic-embed-text-v1.5.Q8_0.gguf"  # Replace with your desired embedding model
-
-# ===========================
-# In-Memory Knowledge Database
-# ===========================
-
-class InMemoryKnowledgeDB:
+class Config:
+    """Handles loading and validating configuration parameters."""
     def __init__(self):
-        self.knowledge: List[Tuple[str, np.ndarray]] = []
+        self.BASE_URL = os.getenv("LMSTUDIO_API_BASE_URL", "http://localhost:1234/v1")
+        self.CHAT_MODEL = os.getenv("CHAT_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct")
+        self.EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text-v1.5.Q8_0.gguf")
+        self.MODEL_MAX_TOKENS = int(os.getenv("MODEL_MAX_TOKENS", 32768))
+        self.EMBEDDING_MODEL_MAX_TOKENS = int(os.getenv("EMBEDDING_MODEL_MAX_TOKENS", 8192))
+        self.BUFFER_TOKENS = int(os.getenv("BUFFER_TOKENS", 1500))
+        self.MIN_OUTPUT_TOKENS = int(os.getenv("MIN_OUTPUT_TOKENS", 8000))
+        self.MAX_EMBEDDINGS = int(os.getenv("MAX_EMBEDDINGS", 100))
+        self.HTTPX_TIMEOUT = int(os.getenv("HTTPX_TIMEOUT", 300))
+        self.HISTORY_FILE_PATH = os.getenv("HISTORY_FILE_PATH", "chat_history.json")
+        self.DB_PATH = os.getenv("DB_PATH", "chroma_db")
+        self.EMBEDDING_MODEL_HUGGING_FACE_NAME = os.getenv("EMBEDDING_MODEL_HUGGING_FACE_NAME", "nomic-ai/nomic-embed-text-v1.5")
+        self.BIAS_DETECTOR_MODEL = os.getenv("BIAS_DETECTOR_MODEL", "unitary/unbiased-toxic-roberta")
+        self.API_KEY = os.getenv("API_KEY", self._generate_api_key())
+        self.CONVERSATION_CONTEXT_DEPTH = int(os.getenv("CONVERSATION_CONTEXT_DEPTH", 3))
+        self.VECTOR_DATABASE_BATCH_SIZE = int(os.getenv("VECTOR_DATABASE_BATCH_SIZE", 5))
+        self.QWEN_TOKENIZER_NAME = os.getenv("QWEN_TOKENIZER_NAME", "Qwen/Qwen2.5-Coder-32B-Instruct")
+        self.NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self.NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+        self.NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+        self.EMBEDDING_DIMS = int(os.getenv("EMBEDDING_DIMS", 768))
+        self.NUM_EPOCHS = int(os.getenv("NUM_EPOCHS", 3))
+        self.LEARNING_RATE = float(os.getenv("LEARNING_RATE", 0.0001))
 
-    def add_item(self, text: str, embedding: np.ndarray):
-        """Adds an item to the knowledge base."""
-        if not isinstance(embedding, np.ndarray):
-            logger.error("Invalid embedding type. Expected numpy array.")
-            return
-        self.knowledge.append((text, embedding))
+        if not self.BASE_URL.startswith("http"):
+            raise ValueError(f"Invalid BASE_URL: {self.BASE_URL}. Must start with 'http'.")
 
-    def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Tuple[str, float]]:
-        """
-        Searches for similar items in the knowledge database, with diversity enhancement.
-        Returns top-k items with their similarity scores.
-        """
-        if not self.knowledge:
+        self.USE_GPU = torch.cuda.is_available()
+        self.DEVICE = torch.device("cuda" if self.USE_GPU else "cpu")
+        logger.info(f"GPU Available: {self.USE_GPU}, Device: {self.DEVICE}")
+
+        # Setup a simple async rate limiter: 10 requests/minute
+        self.rate_limiter = AsyncLimiter(10, 60)
+
+    def _generate_api_key(self):
+        """Generate a random API key if not provided in environment"""
+        return hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+
+config = Config()
+
+# Create a global rate limiter using aiolimiter
+# 10 requests per 60 seconds as an example
+limiter = AsyncLimiter(10, 60)
+
+# ===========================
+# Interface Protocols
+# ===========================
+class VectorStore(Protocol):
+    def add_item(self, text: str, metadata=None) -> None:
+        ...
+    def search(self, query_text: str, k: int = 5, diversity_factor: float = 0.5) -> List[Tuple[str, float]]:
+        ...
+
+class EmbeddingModel(Protocol):
+    async def get_embeddings(self, text: str) -> Optional[np.ndarray]:
+        ...
+
+class BiasDetector(Protocol):
+    def detect_bias(self, text: str) -> bool:
+        ...
+
+# ===========================
+# In-Memory GPU Vector Database
+# ===========================
+class InMemoryGPUVectorDB:
+    """
+    Vector database using PyTorch tensors on GPU.
+    """
+    def __init__(self, config: Config):
+        self.config = config
+        self.embeddings = []
+        self.texts = []
+
+    def add_item(self, text: str, metadata=None):
+        """Adds a single item to the index"""
+        embedding = asyncio.run(embedding_model.get_embeddings(text))
+        if embedding is not None:
+            self.embeddings.append(torch.tensor(embedding, dtype=torch.float32, device=self.config.DEVICE))
+            self.texts.append(text)
+            logger.info(f"Added document to in-memory vector DB: {text[:50]}...")
+
+    def search(self, query_text: str, k: int = 5, diversity_factor: float = 0.5) -> List[Tuple[str, float]]:
+        """Searches the tensor index for similar items and uses MMR."""
+        query_embedding = asyncio.run(embedding_model.get_embeddings(query_text))
+        if query_embedding is None:
+            logger.warning("Failed to generate embedding for query text.")
+            return []
+        query_embedding = torch.tensor(query_embedding, dtype=torch.float32, device=self.config.DEVICE)
+
+        if not self.embeddings:
+            logger.info("No items in vector DB.")
             return []
 
-        similarities = []
-        for text, embedding in self.knowledge:
-            similarity = calculate_similarity(query_embedding, embedding)
-            similarities.append((text, embedding, similarity))  # Include embedding for diversity check
+        similarities = torch.stack([self._calculate_similarity(query_embedding, emb) for emb in self.embeddings])
+        # Sort by highest scores
+        scores, indices = torch.sort(similarities, descending=True)
+        results = [(self.texts[i], float(scores[idx])) for idx, i in enumerate(indices[:10*k])]
+        return self._mmr(query_text, results, k, diversity_factor)
 
-        similarities.sort(key=lambda x: x[2], reverse=True)
+    def _mmr(self, query: str, results: List[Tuple[str, float]], k: int, diversity_factor: float) -> List[Tuple[str, float]]:
+        """Maximum Marginal Relevance ranking for more diverse results."""
+        if not results:
+            return []
 
-        # Select top k items, ensuring diversity
-        selected = []
-        for text, embedding, score in similarities:
-            is_diverse = True
-            for selected_text, selected_embedding, _ in selected:
-                # Check if the current item is too similar to already selected items
-                if calculate_similarity(embedding, selected_embedding) > 0.9:  # Diversity threshold
-                    is_diverse = False
-                    break
-            if is_diverse:
-                selected.append((text, embedding, score))
-            if len(selected) == k:
+        selected_indices = []
+        remaining_indices = list(range(len(results)))
+
+        for _ in range(k):
+            if not remaining_indices:
                 break
 
-        return [(text, score) for text, _, score in selected]
+            best_index = -1
+            best_score = float('-inf')
 
-knowledge_db = InMemoryKnowledgeDB()
+            for i in remaining_indices:
+                text, similarity = results[i]
+                mmr_score = (1 - diversity_factor) * similarity
+                if selected_indices:
+                    max_sim_selected = max([self._calculate_similarity(text, results[j][0]).cpu().item() for j in selected_indices])
+                    mmr_score -= diversity_factor * max_sim_selected
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_index = i
+
+            if best_index != -1:
+                selected_indices.append(best_index)
+                remaining_indices.remove(best_index)
+
+        return [results[index] for index in selected_indices]
+
+    def _calculate_similarity(self, embedding1: torch.Tensor, embedding2: torch.Tensor) -> torch.Tensor:
+        """Calculate cosine similarity between two embeddings."""
+        dot_product = torch.dot(embedding1, embedding2)
+        norm1 = torch.norm(embedding1)
+        norm2 = torch.norm(embedding2)
+        if norm1 == 0 or norm2 == 0:
+            return torch.tensor(0.0, device=self.config.DEVICE)
+        return dot_product / (norm1 * norm2)
+
+    def add_items_batched(self, texts: List[str], metadatas: Optional[List[Any]] = None) -> None:
+        """Adds items in batched mode"""
+        for text in texts:
+            self.add_item(text)
+
+vector_db = InMemoryGPUVectorDB(config)
+
+# ===========================
+# Tokenizer Setup
+# ===========================
+class Tokenizer:
+    """Handles token counting using a Hugging Face tokenizer."""
+    def __init__(self, config: Config):
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(config.QWEN_TOKENIZER_NAME)
+            logger.info("Tokenizer initialized.")
+        except Exception as e:
+            logger.error(f"Error initializing tokenizer: {e}")
+            raise
+
+    def count_tokens(self, text: str) -> int:
+        """Returns the number of tokens in the given text."""
+        if not text:
+            return 0
+        tokens = self.tokenizer(text)
+        return len(tokens['input_ids'])
+
+tokenizer = Tokenizer(config)
 
 # ===========================
 # Utility Functions
 # ===========================
-
-@lru_cache(maxsize=128)
-def calculate_max_tokens(message_history_length: int, model_max_tokens: int = MODEL_MAX_TOKENS,
-                        buffer: int = BUFFER_TOKENS, avg_chars_per_token: int = AVERAGE_CHARS_PER_TOKEN,
-                        min_output_tokens: int = MIN_OUTPUT_TOKENS) -> int:
-    """
-    Calculates the maximum number of tokens for the output, prioritizing output length.
-
-    This function now prioritizes having at least min_output_tokens available for the
-    response. It dynamically adjusts the context window if necessary to accommodate this
-    requirement.
-    """
-    # Estimate the number of tokens used by the input (message history)
-    input_tokens = int(message_history_length / avg_chars_per_token)
-
-    # Calculate the remaining tokens after accounting for the minimum output tokens and buffer
-    remaining_tokens = model_max_tokens - min_output_tokens - buffer
-
-    # Determine how many tokens to allocate to the context
+def calculate_max_tokens(message_history_length: int, config: Config) -> int:
+    """Calculate maximum tokens for output given constraints."""
+    input_tokens = message_history_length
+    remaining_tokens = config.MODEL_MAX_TOKENS - config.MIN_OUTPUT_TOKENS - config.BUFFER_TOKENS
     context_tokens = min(input_tokens, remaining_tokens)
-
-    # If there's not enough room for the minimum output, log a warning.
     if context_tokens < 0:
-        logger.warning(f"Insufficient tokens for minimum output. Output will be {min_output_tokens} tokens.")
-        return min_output_tokens
+        logger.warning(f"Not enough tokens for min output. Using {config.MIN_OUTPUT_TOKENS}.")
+        return config.MIN_OUTPUT_TOKENS
 
-    # Calculate the available space left for output
-    available_output_tokens = model_max_tokens - context_tokens - buffer
+    available_output_tokens = config.MODEL_MAX_TOKENS - context_tokens - config.BUFFER_TOKENS
+    max_tokens = max(available_output_tokens, config.MIN_OUTPUT_TOKENS)
 
-    # Use the larger value between the minimum output tokens and the available output tokens
-    max_tokens = max(available_output_tokens, min_output_tokens)
-
-    logger.info(f"Calculated max tokens: {max_tokens}, Context tokens: {context_tokens}, Input tokens: {input_tokens}")
+    logger.info(f"Max tokens: {max_tokens}, Context tokens: {context_tokens}, Input tokens: {input_tokens}")
     return max_tokens
 
-async def get_embeddings(text: str) -> Optional[np.ndarray]:
-    """Retrieves embeddings, handling potential empty text and tokenization."""
-    text = text.strip()
-    if not text:
-        logger.warning("Attempted to get embeddings for empty text.")
-        return None
 
-    tokenized_text = text.split()
-    chunks = [' '.join(tokenized_text[i:i + EMBEDDING_MODEL_MAX_TOKENS]) for i in range(0, len(tokenized_text), EMBEDDING_MODEL_MAX_TOKENS)]
-
-    embeddings = []
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
-      for chunk in chunks:
-          payload = {"model": EMBEDDING_MODEL, "input": [chunk]}
-          try:
-              response = await client.post(f"{BASE_URL}/embeddings", json=payload)
-              response.raise_for_status()
-              data = response.json()
-              embedding = np.array(data["data"][0]["embedding"], dtype=np.float32)
-              embeddings.append(embedding)
-          except httpx.HTTPError as e:
-              logger.error(f"HTTP error while getting embeddings: {e}")
-              return None
-          except json.JSONDecodeError as e:
-              logger.error(f"JSON decoding error while getting embeddings: {e}")
-              return None
-    
-    # Instead of combining, return the list of embeddings
-    return embeddings if embeddings else None
-
-def calculate_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    """Calculates cosine similarity between two vectors, handling None values."""
-    if vec1 is None or vec2 is None:
-        logger.warning("One or both vectors are None. Returning similarity as 0.0.")
-        return 0.0
-
-    # Ensure the vectors have the same dimensions
-    if vec1.shape != vec2.shape:
-        logger.error("Vectors have different dimensions. Returning similarity as 0.0.")
-        return 0.0
-
-    # Flatten the vectors to 1D arrays
-    vec1 = vec1.flatten()
-    vec2 = vec2.flatten()
-
-    dot_product = np.dot(vec1, vec2)
-    norm_vec1 = np.linalg.norm(vec1)
-    norm_vec2 = np.linalg.norm(vec2)
-
-    if norm_vec1 == 0 or norm_vec2 == 0:
-        logger.warning("Norm of one vector is zero. Returning similarity as 0.0.")
-        return 0.0
-
-    similarity = dot_product / (norm_vec1 * norm_vec2)
-    return similarity
+def sanitize_input(text: str) -> str:
+    """
+    Sanitizes user input to reduce the risk of prompt injection and malicious content.
+    Strips HTML tags, removes backticks and special characters.
+    """
+    # Decode any HTML entities & remove HTML tags
+    clean = html.unescape(text)
+    clean = re.sub(r'<[^>]+>', '', clean)
+    clean = clean.replace('`', '')
+    # Optional: Further sanitation steps can be added here
+    return clean.strip()
 
 # ===========================
-# Internal Reasoning (Enhanced with more steps)
+# HTTP Embedding Model
 # ===========================
+class HttpEmbeddingModel:
+    """Embedding model that retrieves embeddings from a remote server (LM Studio API)."""
+    def __init__(self, config: Config):
+        self.config = config
+        self.model = None  # Placeholder for future fine-tuning
 
-async def generate_internal_reasoning_steps(message: str) -> List[str]:
-    """
-    Generates internal reasoning steps for the user input by breaking it down into sub-components
-    and retrieving relevant knowledge.
-    """
+    @lru_cache(maxsize=256)
+    async def get_embeddings(self, text: str) -> Optional[np.ndarray]:
+        """Get embeddings for given text from the external embedding service."""
+        if not text.strip():
+            logger.warning("Attempted to get embeddings for empty text.")
+            return None
+
+        async with httpx.AsyncClient(timeout=self.config.HTTPX_TIMEOUT) as client:
+            payload = {"model": self.config.EMBEDDING_MODEL, "input": [text]}
+            try:
+                async with limiter:
+                    response = await client.post(f"{self.config.BASE_URL}/embeddings", json=payload)
+                response.raise_for_status()
+                data = response.json()
+                embedding = np.array(data["data"][0]["embedding"], dtype=np.float32)
+                return embedding
+            except httpx.HTTPError as e:
+                logger.error(f"HTTP error getting embeddings: {e}")
+                return None
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error: {e}")
+                return None
+
+    async def fine_tune(self):
+        """A dummy placeholder for future fine-tuning logic."""
+        pass
+
+embedding_model = HttpEmbeddingModel(config)
+
+# ===========================
+# Bias Detection
+# ===========================
+class HFTransformersBiasDetector:
+    """Detects bias using a HuggingFace Transformer model."""
+    def __init__(self, config: Config):
+        self.config = config
+        try:
+            self.model = AutoModel.from_pretrained(self.config.BIAS_DETECTOR_MODEL).to(self.config.DEVICE)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.config.BIAS_DETECTOR_MODEL)
+            logger.info("Bias detector initialized.")
+        except Exception as e:
+            logger.error(f"Error initializing bias detector: {e}")
+            raise
+
+    def detect_bias(self, text: str) -> bool:
+        """Detects bias in the given text."""
+        try:
+            inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True).to(self.config.DEVICE)
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+
+            # Dummy logic: average sigmoid output
+            scores = torch.sigmoid(outputs.last_hidden_state).cpu().numpy().flatten()
+            bias_score = np.mean(scores)
+
+            logger.debug(f"Bias score detected: {bias_score}")
+            return bias_score > 0.65
+        except Exception as e:
+            logger.error(f"Error detecting bias: {e}")
+            return False
+
+bias_detector = HFTransformersBiasDetector(config)
+
+# ===========================
+# Knowledge Graph Context Retrieval
+# ===========================
+class KnowledgeGraphRetriever:
+    def __init__(self, config: Config):
+        self.config = config
+        try:
+            self.driver = GraphDatabase.driver(
+                self.config.NEO4J_URI,
+                auth=(self.config.NEO4J_USER, self.config.NEO4J_PASSWORD)
+            )
+            logger.info("Knowledge graph (Neo4j) initialized.")
+        except Exception as e:
+            logger.error(f"Error initializing Neo4j driver: {e}")
+            raise
+
+    def get_context(self, query_text: str, k: int = 5) -> str:
+        """Retrieves context using graph-based approach."""
+        try:
+            loop = asyncio.get_event_loop()
+            query_embedding = loop.run_until_complete(embedding_model.get_embeddings(query_text))
+            if query_embedding is None:
+                logger.warning("Could not get embedding of query text.")
+                return ""
+
+            with self.driver.session() as session:
+                query = """
+                    MATCH (n:Document)
+                    WITH n, gds.similarity.cosine(n.embedding, $query_embedding) AS similarity
+                    WHERE similarity > 0.5
+                    ORDER BY similarity DESC
+                    LIMIT $k
+                    RETURN n.text AS text, similarity
+                """
+                results = session.run(query, query_embedding=query_embedding.tolist(), k=k)
+                records = [record for record in results]
+
+                context_text = ""
+                for record in records:
+                    text = record["text"]
+                    similarity = record["similarity"]
+                    context_text += f"Context: {text[:200]}... (Similarity: {similarity:.2f})\n"
+
+                logger.info(f"Retrieved context from KG: {context_text[:200]}...")
+                return context_text
+        except Exception as e:
+            logger.error(f"Error accessing Neo4j graph database: {e}")
+            return ""
+
+    def add_item(self, text: str, metadata=None):
+        """Adds item to the knowledge graph. Embeddings must be added as well."""
+        embedding = asyncio.run(embedding_model.get_embeddings(text))
+        if embedding is None:
+            logger.warning("Could not get embedding to add item to the graph.")
+            return
+
+        try:
+            with self.driver.session() as session:
+                query = """
+                    CREATE (n:Document {text: $text, embedding: $embedding})
+                """
+                session.run(query, text=text, embedding=embedding.tolist())
+                logger.info(f"Added document to knowledge graph: {text[:50]}...")
+        except Exception as e:
+            logger.error(f"Error adding item to Neo4j graph: {e}")
+
+    def add_items_batched(self, texts: List[str], metadatas: Optional[List[Any]] = None) -> None:
+        """Add items in batches."""
+        if not texts:
+            logger.warning("Attempted to add an empty list of texts to the graph.")
+            return
+        for text in texts:
+            self.add_item(text)
+
+
+graph_context_retriever = KnowledgeGraphRetriever(config)
+
+# ===========================
+# Chain-of-Thought Reasoning
+# ===========================
+class ChainOfThoughtReasoning:
+    """Implements chain-of-thought prompting for enhanced reasoning."""
+    def __init__(self, config: Config):
+        self.config = config
+
+    async def generate_reasoning(self, message: str, max_iterations=3) -> str:
+        """Generates chain of thought reasoning iteratively with verification."""
+        if not message.strip():
+            logger.warning("Attempted to generate reasoning for empty message.")
+            return ""
+
+        reasoning = ""
+        for i in range(max_iterations):
+            cot_prompt = f"""
+                You are an expert at breaking down complex questions using chain-of-thought prompting.
+                Given the user query: '{message}', provide a detailed reasoning process, step-by-step,
+                before giving the final answer. Start by explicitly stating the key steps to solve this problem.
+                Current Reasoning: {reasoning}
+            """
+
+            new_reasoning = ""
+            async for chunk in chat_with_lmstudio([{"role": "user", "content": cot_prompt}], self.config):
+                new_reasoning += chunk
+
+            reasoning = new_reasoning.strip()
+            if self._verify_reasoning(reasoning):
+                break
+            logger.info(f"Reasoning iteration {i+1}: {reasoning[:100]}...")
+        logger.info("Chain-of-thought reasoning generated.")
+        return reasoning
+
+    def _verify_reasoning(self, reasoning: str) -> bool:
+        """Placeholder for verification logic."""
+        if not reasoning:
+            return False
+        return True
+
+cot_reasoning = ChainOfThoughtReasoning(config)
+
+# ===========================
+# LLM Streaming
+# ===========================
+async def chat_with_lmstudio(messages: List[Dict], config: Config, model_name: Optional[str] = None) -> AsyncGenerator[str, None]:
+    """Stream responses from LM Studio's chat endpoint."""
+    model_name = model_name or config.CHAT_MODEL
+    url = f"{config.BASE_URL}/chat/completions"
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": 1,
+        "top_p": 0.9,
+        "max_tokens": config.MODEL_MAX_TOKENS,
+        "stream": True
+    }
+
+    async with httpx.AsyncClient(timeout=config.HTTPX_TIMEOUT) as client:
+        try:
+            logger.info("Requesting streamed chat completion.")
+            async with limiter:
+                async with client.stream("POST", url, json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if line.strip() == "data: [DONE]":
+                            logger.info("Received [DONE] from LLM.")
+                            break
+                        elif line.startswith("data:"):
+                            data = json.loads(line[6:])
+                            content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                            if content:
+                                yield content
+        except httpx.ReadTimeout as e:
+            logger.error("Timeout during LLM streaming.")
+            yield "The operation timed out."
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error in LLM streaming: {e}")
+            yield "HTTP error occurred."
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decoding error: {e}")
+            yield "JSON decode error."
+        except Exception as e:
+            logger.error(f"Unexpected error in LLM streaming: {e}")
+            yield "Unexpected error."
+
+# ===========================
+# History Management
+# ===========================
+def load_history(config: Config) -> Dict:
+    """Load conversation history from a file."""
+    if not os.path.exists(config.HISTORY_FILE_PATH):
+        logger.warning("No history file found.")
+        return {"messages_history": []}
     try:
-        message = message.strip()
-        if not message:
-            logger.warning("Attempted to generate reasoning steps for empty message.")
-            return []
+        with open(config.HISTORY_FILE_PATH, "r") as f:
+            history = json.load(f)
+        if not isinstance(history, dict) or "messages_history" not in history:
+            logger.warning("History file format is invalid. Starting fresh.")
+            return {"messages_history": []}
 
-        # Generate embeddings for the full message
-        full_message_embedding = await get_embeddings(message)
-        if full_message_embedding is None:
-            logger.error("Failed to generate embeddings for the full message.")
-            return []
-
-        steps = [
-            "Step 1: Analyzing the user input based on embeddings.",
-            "Step 2: Breaking down the problem into sub-components (using regex patterns)."
-        ]
-
-        # Use regex to identify sub-components in the message
-        sub_components = re.findall(r"(?:^|\s)(?:[Ww]hat|[Cc]an you|[Tt]ell me about|[Hh]ow to|[Dd]escribe|[Ee]xplain|[Ii]dentify)(.*?)(?=[?.!]|and|;|$)", message)
-        sub_components = [comp.strip() for comp in sub_components if comp.strip()]
-
-        for i, component in enumerate(sub_components):
-            steps.append(f"  Sub-component {i + 1}: {component[:50]}...")
-
-        steps.append("Step 3: Retrieving relevant knowledge for each sub-component.")
-        for i, component in enumerate(sub_components):
-            component_embeddings = await get_embeddings(component)
-            
-            if component_embeddings is not None:
-              # Treat each embedding as a separate query to the knowledge base
-              for embedding in component_embeddings:
-                  similar_items = knowledge_db.search(embedding)
-                  if similar_items:
-                      best_match, score = similar_items[0]
-                      steps.append(f"  For sub-component {i + 1}, retrieved knowledge: '{best_match[:50]}...' (similarity: {score:.2f})")
-                  else:
-                      steps.append(f"  For sub-component {i + 1}, no relevant knowledge found.")
-            else:
-              logger.error(f"Could not generate embeddings for sub-component {i + 1}")
-
-        steps.append("Step 4: Synthesizing an overall response based on the retrieved knowledge and the original query.")
-        
-        logger.info(f"Generated internal reasoning steps: {steps}")
-        return steps
-
+        # Validate message formats
+        for msg in history["messages_history"]:
+            if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+                logger.error("Invalid message format in history. Resetting history.")
+                return {"messages_history": []}
+        return history
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON from history file: {e}")
+        return {"messages_history": []}
     except Exception as e:
-        logger.error(f"Error generating internal reasoning steps: {e}")
-        return []
-
-# ===========================
-# API Interaction Handling (Asynchronous Streaming)
-# ===========================
-
-async def chat_with_lmstudio(messages: List[Dict], model_name: str = CHAT_MODEL,
-                             temperature: float = 1, top_p: float = 0.9, max_tokens: int = MODEL_MAX_TOKENS) -> AsyncGenerator[str, None]:
-    """Handles chat completions with the LM Studio API using asynchronous streaming."""
-    url = f"{BASE_URL}/chat/completions"
-    payload = {"model": model_name, "messages": messages, "temperature": temperature, "top_p": top_p, "max_tokens": max_tokens, "stream": True}
-
-    async with httpx.AsyncClient(timeout=HTTPX_TIMEOUT) as client:
-      try:
-          logger.info("Sending chat completion request to LM Studio API.")
-          async with client.stream("POST", url, json=payload) as response:
-              response.raise_for_status()
-              async for line in response.aiter_lines():
-                  if line.strip() == "data: [DONE]":
-                      logger.info("Received [DONE] signal from LM Studio.")
-                      break
-                  elif line.startswith("data:"):
-                      data = json.loads(line[6:])
-                      content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                      if content:
-                          logger.debug(f"Received response chunk: {content[:50]}...")
-                          yield content
-      except httpx.ReadTimeout:
-          logger.error("Timeout error during chat completion streaming.")
-          yield "The operation timed out. Please try again."
-      except httpx.HTTPError as e:
-          logger.error(f"HTTP error during chat completion streaming: {e}")
-          yield "An HTTP error occurred. Please check the server status and logs."
-      except json.JSONDecodeError as e:
-          logger.error(f"JSON decoding error during chat completion streaming: {e}")
-          yield "An error occurred while decoding the server's response. Please check the server logs."
-      except Exception as e:
-          logger.error(f"Unexpected error during chat completion streaming: {e}")
-          yield "An unexpected error occurred. Please try again later."
+        logger.error(f"Error loading history: {e}")
+        return {"messages_history": []}
 
 # ===========================
 # Chat Handler
 # ===========================
-
-async def chat_handler(message: str, file_obj: Optional[object], state: Dict, internal_reasoning: bool,
-                       model_name: str, temperature: float, top_p: float, chatbot_history: List[List],
-                       context_display: str, reasoning_steps_display: str) -> Tuple[List[List], Dict, str, str]:
-    logger.info("Handling new user message.")
-
+async def chat_handler(message: str, state: Dict, internal_reasoning: bool,
+                       model_name: str, temperature: float, top_p: float, min_output_tokens: int,
+                       chatbot_history: List[List],
+                       context_display: str, reasoning_steps_display: str,
+                       config: Config) -> Tuple[List[List], Dict, str, str]:
+    """Handles a new chat turn without file upload."""
+    logger.info("Received new user message.")
+    updated_chat = [] #Initialize here
     try:
-        original_message = message.strip()
+        original_message = sanitize_input(message)
         if not original_message:
             yield chatbot_history, state, "", ""
             return
 
-        embeddings = state.get("embeddings", [])
         messages_history = state.get("messages_history", [])
         updated_chat = chatbot_history.copy() if chatbot_history else []
 
-        if file_obj is not None:
-            try:
-                if not file_obj.orig_name.lower().endswith(".txt"):
-                    raise ValueError("Invalid file type. Only .txt files are allowed.")
 
-                logger.info(f"Processing uploaded file: {file_obj.orig_name}")
-                file_content = file_obj.read().decode("utf-8")
-                message += f"\n[File Content]:\n{file_content}"
-
-                file_content_embedding = await get_embeddings(file_content)
-                if file_content_embedding is not None:
-                    knowledge_db.add_item(file_content, file_content_embedding)
-
-            except ValueError as e:
-                updated_chat.append([original_message, str(e)])
-                yield updated_chat, state, "", ""
-                return
-            except UnicodeDecodeError:
-                updated_chat.append([original_message, "Error: Could not decode file. Ensure it is a UTF-8 encoded text file."])
-                yield updated_chat, state, "", ""
-                return
-            except Exception as e:
-                logger.error(f"Error reading file: {e}")
-                updated_chat.append([original_message, "Error reading file."])
-                yield updated_chat, state, "", ""
-                return
-
-        # Generate embeddings for the user message
-        user_embeddings = await get_embeddings(message)
-        if user_embeddings is not None:
-            logger.info("Embeddings generated for user message.")
-            # Store each embedding individually
-            for embedding in user_embeddings:
-                embeddings.append(embedding.tolist())  # Convert to list for JSON serialization
-                messages_history.append({"role": "user", "content": original_message})
-        else:
-            updated_chat.append([original_message, "Failed to generate embeddings."])
+        # Get embeddings for the user message
+        user_embedding = await embedding_model.get_embeddings(original_message)
+        if user_embedding is None:
+            updated_chat.append([original_message, "Failed to get embeddings."])
             yield updated_chat, state, "", ""
             return
 
-        if len(embeddings) > MAX_EMBEDDINGS:
-            logger.info("Trimming embeddings and message history.")
-            embeddings = embeddings[-MAX_EMBEDDINGS:]
-            messages_history = messages_history[-MAX_EMBEDDINGS:]
+        # Store message and embeddings
+        messages_history.append({"role": "user", "content": original_message, "embedding": user_embedding.tolist()})
+        if len(messages_history) > config.MAX_EMBEDDINGS:
+            messages_history = messages_history[-config.MAX_EMBEDDINGS:]
 
-        history = [*messages_history]
-        context_text = ""
+        # Fetch context using graph-based method
+        context_text = graph_context_retriever.get_context(original_message)
 
-        if len(embeddings) > 1:
-            logger.info("Retrieving relevant context from knowledge base.")
-            # Use the latest user embedding for context retrieval
-            latest_user_embedding = user_embeddings[-1]  # Use the last embedding
-            similar_items = knowledge_db.search(latest_user_embedding, k=3)
-            for item, similarity in similar_items:
-                context_text += f"Context: {item[:200]}... (Similarity: {similarity:.2f})\n"
-            if similar_items:
-                best_match, _ = similar_items[0]
-                history.insert(0, {"role": "system", "content": best_match})
+        # Create a system message using the context for the LLM
+        system_message = f"You are a helpful assistant. Here is some context for you to use: {context_text}"
+        history_for_llm = [{"role": "system", "content": system_message}]
 
-        total_message_history_length = sum(len(msg["content"]) for msg in messages_history)
-        max_tokens = calculate_max_tokens(total_message_history_length)
+        # Limit to last k messages for conversation context
+        history_for_llm += [{"role": msg["role"], "content": msg["content"]} for msg in messages_history[-config.CONVERSATION_CONTEXT_DEPTH:]]
 
-        response = ""
-        updated_chat.append([original_message, None])
+        # Token calculation
+        total_length = sum(tokenizer.count_tokens(msg["content"]) for msg in messages_history)
+        max_tokens = calculate_max_tokens(total_length, config)
 
+        # Apply Chain-of-Thought reasoning
         reasoning_text = ""
         if internal_reasoning:
-            reasoning_steps = await generate_internal_reasoning_steps( original_message)
-            reasoning_text = "\n".join(reasoning_steps)
+            reasoning_text = await cot_reasoning.generate_reasoning(original_message)
 
-        history.append({"role": "user", "content": original_message})
+        updated_chat.append([original_message, None])
+        response = ""
+
         try:
-            logger.info("Sending chat request to LM Studio.")
-            async for chunk in chat_with_lmstudio( history, model_name, temperature, top_p, max_tokens):
+            async for chunk in chat_with_lmstudio(history_for_llm, config, model_name):
                 response += chunk
                 updated_chat[-1] = [original_message, response]
-                yield updated_chat, {"embeddings": embeddings, "messages_history": messages_history}, context_text, reasoning_text
-
+                yield updated_chat, {"messages_history": messages_history}, context_text, reasoning_text
         except Exception as e:
             logger.error(f"Error during chat response generation: {e}")
             updated_chat.append([original_message, "An error occurred."])
             yield updated_chat, state, "", ""
             return
 
+        # Detect Bias
+        if bias_detector.detect_bias(response):
+            logger.warning(f"Bias detected in the response: {response}")
+            updated_chat[-1] = [original_message, "Response contains potential bias."]
+
         messages_history.append({"role": "assistant", "content": response})
-        new_state = {"embeddings": embeddings, "messages_history": messages_history}
+        new_state = {"messages_history": messages_history}
 
         try:
-            with open(HISTORY_FILE_PATH, "w") as f:
+            with open(config.HISTORY_FILE_PATH, "w") as f:
                 json.dump(new_state, f)
             logger.info("Conversation history saved successfully.")
         except Exception as e:
@@ -399,20 +580,19 @@ async def chat_handler(message: str, file_obj: Optional[object], state: Dict, in
         yield updated_chat, new_state, context_text, reasoning_text
 
     except Exception as e:
-        logger.error(f"Error in chat_handler: {e}")
+        logger.error(f"Exception in chat_handler: {e}")
         updated_chat.append([original_message, "An error occurred while processing your request. Please try again later."])
         yield updated_chat, state, "", ""
 
 # ===========================
-# Gradio Interface Implementation
+# Gradio Interface
 # ===========================
-
-async def gradio_chat_interface():
-    """Creates and launches the Gradio Blocks interface."""
-    demo = gr.Blocks(title="LM Studio Chat Interface - Enhanced Version")
-    async with httpx.AsyncClient(timeout=httpx.Timeout(HTTPX_TIMEOUT)) as client:
-      with demo:
-        gr.Markdown("# 🚀 High-Performance Chat Interface for LM Studio - Enhanced Version")
+async def gradio_chat_interface(config: Config):
+    """Creates and launches the Gradio interface."""
+    demo = gr.Blocks(title="LM Studio Chat Interface")
+    
+    with demo:
+        gr.Markdown("# 🚀 High-Performance Chat Interface")
 
         with gr.Row():
             with gr.Column(scale=2):
@@ -423,124 +603,112 @@ async def gradio_chat_interface():
                         label="Your Message",
                         placeholder="Type your message here...",
                         lines=2,
-                        scale=4
                     )
-                    send_button = gr.Button("Send", variant="primary", scale=1)
-
-                file_input = gr.UploadButton(label="Upload Context File (.txt)", type="binary")
+                    send_button = gr.Button("Send", variant="primary")
 
             with gr.Column(scale=1):
-                context_display = gr.Textbox(label="Relevant Context", interactive=False, lines=3)
+                context_display = gr.Textbox(label="Relevant Context", interactive=False, lines=5)
+                reasoning_steps_display = gr.Textbox(label="Reasoning Steps", interactive=False, lines=10)
 
                 with gr.Accordion("Advanced Settings", open=False):
                     model_selector = gr.Dropdown(
                         label="Select Model",
-                        choices=[CHAT_MODEL, "Another_Model"],
-                        value=CHAT_MODEL
+                        choices=[config.CHAT_MODEL, "Another_Model"],
+                        value=config.CHAT_MODEL
                     )
                     temperature_slider = gr.Slider(
-                        label="Temperature (controls randomness)",
+                        label="Temperature",
                         minimum=0.1,
                         maximum=2.0,
                         step=0.1,
                         value=1.0
                     )
                     top_p_slider = gr.Slider(
-                        label="Top-p (controls diversity of tokens)",
+                        label="Top-p",
                         minimum=0.1,
                         maximum=1.0,
                         step=0.1,
                         value=0.9
                     )
+                    min_output_tokens_slider = gr.Slider(
+                        label="Minimum Output Tokens",
+                        minimum=1000,
+                        maximum=20000,
+                        step=100,
+                        value=config.MIN_OUTPUT_TOKENS
+                    )
                     internal_reasoning_checkbox = gr.Checkbox(label="Enable Internal Reasoning", value=False)
 
-                reasoning_steps_display = gr.Textbox(label="Reasoning Steps", interactive=False, lines=10)
-                embeddings_display = gr.Textbox(label="Embeddings History", interactive=False, lines=10)
-
-        history_state = load_history()
+        history_state = load_history(config)
         embeddings_state = gr.State(history_state)
 
+        # Connect events
         send_button.click(
             chat_handler,
-            inputs=[user_input, file_input, embeddings_state, internal_reasoning_checkbox, model_selector, temperature_slider, top_p_slider, chatbot_history, context_display, reasoning_steps_display],
-            outputs=[chatbot_history, embeddings_state, context_display, reasoning_steps_display]
+            inputs=[
+                user_input,
+                embeddings_state,
+                internal_reasoning_checkbox,
+                model_selector,
+                temperature_slider,
+                top_p_slider,
+                min_output_tokens_slider,
+                chatbot_history,
+                context_display,
+                reasoning_steps_display,
+                gr.State(config)
+            ],
+            outputs=[
+                chatbot_history,
+                embeddings_state,
+                context_display,
+                reasoning_steps_display
+            ]
         )
 
         user_input.submit(
             chat_handler,
-            inputs=[user_input, file_input, embeddings_state, internal_reasoning_checkbox, model_selector, temperature_slider, top_p_slider, chatbot_history, context_display, reasoning_steps_display],
-            outputs=[chatbot_history, embeddings_state, context_display, reasoning_steps_display]
+            inputs=[
+                user_input,
+                embeddings_state,
+                internal_reasoning_checkbox,
+                model_selector,
+                temperature_slider,
+                top_p_slider,
+                min_output_tokens_slider,
+                chatbot_history,
+                context_display,
+                reasoning_steps_display,
+                 gr.State(config)
+            ],
+            outputs=[
+                chatbot_history,
+                embeddings_state,
+                context_display,
+                reasoning_steps_display
+            ]
         )
 
-        def format_embeddings(embeddings):
-            """Formats the embeddings for display."""
-            if embeddings and embeddings["messages_history"]:
-                formatted_embeddings = "\n".join([f"Message: {msg['content']}\nEmbedding: {str(emb)[:50]}..." for msg, emb in zip(embeddings["messages_history"], embeddings["embeddings"])])
-                return f"<pre>{formatted_embeddings}</pre>"
-            else:
-                return "No embeddings available."
-
-        async def update_embeddings_display(embeddings_state):
-            """Updates the embeddings display."""
-            formatted_embeddings = format_embeddings(embeddings_state)
-            return formatted_embeddings
-
-        chatbot_history.change(
-            update_embeddings_display,
-            inputs=[embeddings_state],
-            outputs=embeddings_display
-        )
-
-        logger.info("Launching Gradio interface.")
-        await demo.queue().launch(share=True, server_name="0.0.0.0", server_port=7860)
-
-def load_history() -> Dict:
-    """Loads conversation history from a file or returns an empty history if the file does not exist or is invalid."""
-    if not os.path.exists(HISTORY_FILE_PATH):
-        logger.warning("History file does not exist. Starting with an empty history.")
-        return {"embeddings": [], "messages_history": []}
-
-    try:
-        with open(HISTORY_FILE_PATH, "r") as f:
-            history = json.load(f)
-        
-        if not isinstance(history, dict) or "embeddings" not in history or "messages_history" not in history:
-            logger.warning("History file format is invalid. Starting with an empty history.")
-            return {"embeddings": [], "messages_history": []}
-
-        embeddings = history.get("embeddings", [])
-        messages_history = history.get("messages_history", [])
-
-        # Validate embeddings and messages history
-        for embedding in embeddings:
-            if not isinstance(embedding, list):
-                logger.error("Invalid embedding format in history file.")
-                return {"embeddings": [], "messages_history": []}
-
-        for message in messages_history:
-            if not isinstance(message, dict) or "role" not in message or "content" not in message:
-                logger.error("Invalid message format in history file.")
-                return {"embeddings": [], "messages_history": []}
-
-        return history
-    except json.JSONDecodeError as e:
-        logger.error(f"Error decoding JSON from history file: {e}")
-        return {"embeddings": [], "messages_history": []}
-    except Exception as e:
-        logger.error(f"Error loading history: {e}")
-        return {"embeddings": [], "messages_history": []}
+    logger.info("Launching Gradio interface.")
+    await demo.queue().launch(share=True, server_name="0.0.0.0", server_port=7860)
 
 # ===========================
 # Main Execution
 # ===========================
-
 if __name__ == "__main__":
     logger.info("Starting main execution.")
     try:
-        knowledge_db.add_item("Pandas can be used to read CSV files.", np.random.rand(768).astype(np.float32))
-        knowledge_db.add_item("Matplotlib can create bar charts.", np.random.rand(768).astype(np.float32))
-        knowledge_db.add_item("The average can be calculated by grouping data in Pandas.", np.random.rand(768).astype(np.float32))
+        vector_db.add_item("Pandas can be used to read CSV files.")
+        vector_db.add_item("Matplotlib can create bar charts.")
+        vector_db.add_item("The average can be calculated by grouping data in Pandas.")
+        vector_db.add_item("FAISS allows efficient similarity search over large datasets.")
+        vector_db.add_item("Neo4j is a powerful graph database for storing interconnected data.")
+        vector_db.add_item("Transformers can be fine-tuned for specific NLP tasks.")
+        vector_db.add_item("Gradio provides an easy way to create web interfaces for ML models.")
+        vector_db.add_item("Cosine similarity is commonly used in text similarity tasks.")
+        vector_db.add_item("HTTPX is an asynchronous HTTP client for Python.")
+        vector_db.add_item("Environment variables can be managed using dotenv.")
 
-        asyncio.run(gradio_chat_interface())
+        asyncio.run(gradio_chat_interface(config))
     except Exception as e:
-        logger.exception(f"An error occurred: {e}")
+        logger.exception(f"An error occurred during startup: {e}")
