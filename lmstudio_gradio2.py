@@ -15,10 +15,11 @@ import hashlib
 import torch.nn as nn
 from dotenv import load_dotenv
 from aiolimiter import AsyncLimiter
+import re
 from neo4j import GraphDatabase
 from chromadb.utils import embedding_functions
 import html
-import re
+
 
 load_dotenv()
 
@@ -253,7 +254,7 @@ class HttpEmbeddingModel:
             payload = {"model": self.config.EMBEDDING_MODEL, "input": [text]}
             try:
                 async with limiter:
-                    response = await client.post(f"{self.config.BASE_URL}/embeddings", json=payload)
+                   response = await client.post(f"{self.config.BASE_URL}/embeddings", json=payload)
                 response.raise_for_status()
                 data = response.json()
                 embedding = np.array(data["data"][0]["embedding"], dtype=np.float32)
@@ -379,7 +380,6 @@ class KnowledgeGraphRetriever:
         for text in texts:
             self.add_item(text)
 
-
 graph_context_retriever = KnowledgeGraphRetriever(config)
 
 # ===========================
@@ -413,6 +413,12 @@ class ChainOfThoughtReasoning:
             if self._verify_reasoning(reasoning):
                 break
             logger.info(f"Reasoning iteration {i+1}: {reasoning[:100]}...")
+            if tokenizer.count_tokens(reasoning) > 1000:
+              logger.info(f"Reasoning exceeds 1000 token limit. Truncating.");
+              reasoning = tokenizer.tokenizer.decode(tokenizer.tokenizer(reasoning, truncation=True, max_length=1000)['input_ids'])
+              break;
+
+
         logger.info("Chain-of-thought reasoning generated.")
         return reasoning
 
@@ -423,6 +429,7 @@ class ChainOfThoughtReasoning:
         return True
 
 cot_reasoning = ChainOfThoughtReasoning(config)
+
 
 # ===========================
 # LLM Streaming
@@ -455,7 +462,7 @@ async def chat_with_lmstudio(messages: List[Dict], config: Config, model_name: O
                             content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
                             if content:
                                 yield content
-        except httpx.ReadTimeout as e:
+        except httpx.ReadTimeout:
             logger.error("Timeout during LLM streaming.")
             yield "The operation timed out."
         except httpx.HTTPError as e:
@@ -467,6 +474,7 @@ async def chat_with_lmstudio(messages: List[Dict], config: Config, model_name: O
         except Exception as e:
             logger.error(f"Unexpected error in LLM streaming: {e}")
             yield "Unexpected error."
+
 
 # ===========================
 # History Management
@@ -496,6 +504,7 @@ def load_history(config: Config) -> Dict:
         logger.error(f"Error loading history: {e}")
         return {"messages_history": []}
 
+
 # ===========================
 # Chat Handler
 # ===========================
@@ -506,7 +515,7 @@ async def chat_handler(message: str, state: Dict, internal_reasoning: bool,
                        config: Config) -> Tuple[List[List], Dict, str, str]:
     """Handles a new chat turn without file upload."""
     logger.info("Received new user message.")
-    updated_chat = [] #Initialize here
+    updated_chat = []
     try:
         original_message = sanitize_input(message)
         if not original_message:
@@ -515,7 +524,6 @@ async def chat_handler(message: str, state: Dict, internal_reasoning: bool,
 
         messages_history = state.get("messages_history", [])
         updated_chat = chatbot_history.copy() if chatbot_history else []
-
 
         # Get embeddings for the user message
         user_embedding = await embedding_model.get_embeddings(original_message)
@@ -590,7 +598,7 @@ async def chat_handler(message: str, state: Dict, internal_reasoning: bool,
 async def gradio_chat_interface(config: Config):
     """Creates and launches the Gradio interface."""
     demo = gr.Blocks(title="LM Studio Chat Interface")
-    
+
     with demo:
         gr.Markdown("# 🚀 High-Performance Chat Interface")
 
@@ -679,7 +687,7 @@ async def gradio_chat_interface(config: Config):
                 chatbot_history,
                 context_display,
                 reasoning_steps_display,
-                 gr.State(config)
+                gr.State(config)
             ],
             outputs=[
                 chatbot_history,
