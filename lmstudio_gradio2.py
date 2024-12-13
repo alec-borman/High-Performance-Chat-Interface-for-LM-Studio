@@ -221,7 +221,6 @@ def calculate_max_tokens(message_history_length: int, config: Config) -> int:
     logger.info(f"Max tokens: {max_tokens}, Context tokens: {context_tokens}, Input tokens: {input_tokens}")
     return max_tokens
 
-
 def sanitize_input(text: str) -> str:
     """
     Sanitizes user input to reduce the risk of prompt injection and malicious content.
@@ -380,6 +379,7 @@ class KnowledgeGraphRetriever:
         for text in texts:
             self.add_item(text)
 
+
 graph_context_retriever = KnowledgeGraphRetriever(config)
 
 # ===========================
@@ -404,9 +404,9 @@ class ChainOfThoughtReasoning:
                 before giving the final answer. Start by explicitly stating the key steps to solve this problem.
                 Current Reasoning: {reasoning}
             """
-
+            
             new_reasoning = ""
-            async for chunk in chat_with_lmstudio([{"role": "user", "content": cot_prompt}], self.config):
+            async for chunk in chat_with_lmstudio([{"role": "user", "content": cot_prompt}], self.config, max_tokens=1000):
                 new_reasoning += chunk
 
             reasoning = new_reasoning.strip()
@@ -414,10 +414,9 @@ class ChainOfThoughtReasoning:
                 break
             logger.info(f"Reasoning iteration {i+1}: {reasoning[:100]}...")
             if tokenizer.count_tokens(reasoning) > 1000:
-              logger.info(f"Reasoning exceeds 1000 token limit. Truncating.");
-              reasoning = tokenizer.tokenizer.decode(tokenizer.tokenizer(reasoning, truncation=True, max_length=1000)['input_ids'])
-              break;
-
+                logger.info(f"Reasoning exceeds 1000 token limit. Truncating.");
+                reasoning = tokenizer.tokenizer.decode(tokenizer.tokenizer(reasoning, truncation=True, max_length=1000)['input_ids'])
+                break;
 
         logger.info("Chain-of-thought reasoning generated.")
         return reasoning
@@ -430,11 +429,10 @@ class ChainOfThoughtReasoning:
 
 cot_reasoning = ChainOfThoughtReasoning(config)
 
-
 # ===========================
 # LLM Streaming
 # ===========================
-async def chat_with_lmstudio(messages: List[Dict], config: Config, model_name: Optional[str] = None) -> AsyncGenerator[str, None]:
+async def chat_with_lmstudio(messages: List[Dict], config: Config, model_name: Optional[str] = None, max_tokens:Optional[int]=None) -> AsyncGenerator[str, None]:
     """Stream responses from LM Studio's chat endpoint."""
     model_name = model_name or config.CHAT_MODEL
     url = f"{config.BASE_URL}/chat/completions"
@@ -443,7 +441,7 @@ async def chat_with_lmstudio(messages: List[Dict], config: Config, model_name: O
         "messages": messages,
         "temperature": 1,
         "top_p": 0.9,
-        "max_tokens": config.MODEL_MAX_TOKENS,
+        "max_tokens": max_tokens or config.MODEL_MAX_TOKENS,
         "stream": True
     }
 
@@ -475,7 +473,6 @@ async def chat_with_lmstudio(messages: List[Dict], config: Config, model_name: O
             logger.error(f"Unexpected error in LLM streaming: {e}")
             yield "Unexpected error."
 
-
 # ===========================
 # History Management
 # ===========================
@@ -503,7 +500,6 @@ def load_history(config: Config) -> Dict:
     except Exception as e:
         logger.error(f"Error loading history: {e}")
         return {"messages_history": []}
-
 
 # ===========================
 # Chat Handler
@@ -560,7 +556,7 @@ async def chat_handler(message: str, state: Dict, internal_reasoning: bool,
         response = ""
 
         try:
-            async for chunk in chat_with_lmstudio(history_for_llm, config, model_name):
+            async for chunk in chat_with_lmstudio(history_for_llm, config, model_name, max_tokens=max_tokens):
                 response += chunk
                 updated_chat[-1] = [original_message, response]
                 yield updated_chat, {"messages_history": messages_history}, context_text, reasoning_text
@@ -598,7 +594,7 @@ async def chat_handler(message: str, state: Dict, internal_reasoning: bool,
 async def gradio_chat_interface(config: Config):
     """Creates and launches the Gradio interface."""
     demo = gr.Blocks(title="LM Studio Chat Interface")
-
+    
     with demo:
         gr.Markdown("# 🚀 High-Performance Chat Interface")
 
@@ -673,7 +669,6 @@ async def gradio_chat_interface(config: Config):
                 reasoning_steps_display
             ]
         )
-
         user_input.submit(
             chat_handler,
             inputs=[
@@ -687,7 +682,7 @@ async def gradio_chat_interface(config: Config):
                 chatbot_history,
                 context_display,
                 reasoning_steps_display,
-                gr.State(config)
+                 gr.State(config)
             ],
             outputs=[
                 chatbot_history,
@@ -696,9 +691,9 @@ async def gradio_chat_interface(config: Config):
                 reasoning_steps_display
             ]
         )
-
     logger.info("Launching Gradio interface.")
     await demo.queue().launch(share=True, server_name="0.0.0.0", server_port=7860)
+
 
 # ===========================
 # Main Execution
