@@ -52,10 +52,6 @@ class KnowledgeBase:
         except FileNotFoundError:
              print("Knowledge base file not found. Please ensure 'knowledge_base.jsonl' exists in the same folder as the script")
 
-
-# Example usage (replace with your actual knowledge base)
-knowledge_base = KnowledgeBase(dimension=EMBEDDING_DIMENSION, filepath="knowledge_base.jsonl")
-
 # --- Embedding Functions ---
 
 def truncate_text_tokens(text, encoding_name=EMBEDDING_ENCODING, max_tokens=EMBEDDING_CTX_LENGTH):
@@ -132,7 +128,7 @@ async def generate_intermediate_completion(prompt: str, conversation_history: Li
 
     payload = {
         "model": CHAT_MODEL_ID,
-        "messages": [{"role": "system", "content": "You are a strategic assistant tasked with planning the optimal response to user requests. Analyze the current conversation to identify the user's intent, and then formulate the necessary steps to fulfill that intent. Detail the reasoning behind these steps and extract key information to provide context for the final response. Your analysis should clearly outline the required actions and their justifications to ensure a comprehensive and well-reasoned final answer."}],
+        "messages": [{"role": "system", "content": "You are a strategic assistant tasked with planning the optimal response to user requests. Analyze the current conversation to identify the user's intent, and then formulate the necessary steps to fulfill that intent. Detail the reasoning behind these steps and extract key information to provide context for the final response. Your analysis should clearly outline the required actions and their justifications to ensure a comprehensive and well-reasoned final answer is created from this intermediate planning session."}],
     }
 
     if formatted_history:
@@ -153,7 +149,8 @@ async def generate_intermediate_completion(prompt: str, conversation_history: Li
                       if 'choices' in data and data['choices']:
                           token = data['choices'][0]['delta'].get('content', '')
                           if token:
-                            yield token
+                            # Add "assistant:" prefix to intermediate responses
+                            yield "assistant: " + token
                    except json.JSONDecodeError:
                        print(f"Error decoding json {line}")
         else:
@@ -169,10 +166,11 @@ async def chat_interface(prompt: str, conversation_history: List[dict], max_toke
             intermediate_response = ""
             async for token in generate_intermediate_completion(prompt, conversation_history, session):
                 intermediate_response += token
+                # Update conversation history with intermediate tokens
                 yield conversation_history + [{"role": "user", "content": prompt}, {"role": "assistant", "content": intermediate_response}]
 
-            # Generate embedding for intermediate response
-            intermediate_embedding = await generate_embeddings(intermediate_response, session)
+            # Generate embedding for intermediate response (without the "assistant:" prefix)
+            intermediate_embedding = await generate_embeddings(intermediate_response.replace("assistant: ", ""), session)
 
             # Retrieve relevant information from knowledge base
             retrieved_context = knowledge_base.search(intermediate_embedding, K_RETRIEVAL)
@@ -184,6 +182,7 @@ async def chat_interface(prompt: str, conversation_history: List[dict], max_toke
             final_response = ""
             async for token in generate_chat_completion(prompt, conversation_history, max_tokens_slider, session, retrieved_context):
                 final_response += token
+                # Update conversation history with final response tokens
                 yield conversation_history + [{"role": "user", "content": prompt}, {"role": "assistant", "content": final_response}]
 
     except Exception as e:
@@ -194,6 +193,9 @@ async def chatbot_interface(prompt: str, conversation_history: List[dict], max_t
         yield history
 
 # --- Gradio Interface ---
+
+# Initialize Knowledge Base (load from the generated file)
+knowledge_base = KnowledgeBase(dimension=EMBEDDING_DIMENSION, filepath="knowledge_base.jsonl")
 
 with gr.Blocks(title="LLM Chat Interface") as iface:
     gr.Markdown("# 🚀 High-Performance Chat Interface with Embeddings (RAG)")
