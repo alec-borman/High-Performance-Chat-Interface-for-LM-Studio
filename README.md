@@ -14,7 +14,7 @@ This version incorporates several advanced features, including an **intermediate
 
 -   **LM Studio Integration:** Connects directly to your local LM Studio server to access various large language models (LLMs).
 -   **Real-time Interaction:** Built using the Gradio framework for a dynamic and interactive chat experience.
--   **Retrieval Augmented Generation (RAG):**  Uses an in memory vector database to enhance responses with relevant context.
+-   **Retrieval Augmented Generation (RAG):** Uses an in-memory vector database to enhance responses with relevant context.
 -   **GPU Acceleration:** Automatically detects and utilizes available GPU resources for faster processing with FAISS.
 -   **Asynchronous Operations:** Employs `async` and `await` to ensure non-blocking API calls, leading to a more responsive user interface.
 -   **Dynamic Token Handling:** Intelligently calculates the maximum number of tokens for responses, prioritizing a minimum output length while respecting model limitations.
@@ -194,16 +194,16 @@ The chat interface now includes an intermediate reasoning step. Before generatin
 
 ## 💾 Vector Database and Retrieval Augmented Generation (RAG)
 
-The `KnowledgeBase` class provides an in-memory vector database using FAISS for efficient similarity search.
+The chat interface leverages an in-memory vector database using FAISS for efficient similarity search.
 
--   **`add_item(text, embedding)`:** Adds a text snippet and its embedding to the database.
--   **`search(query_embedding, k)`:** Searches the database for the `k` most similar items to the given `query_embedding` using L2 distance. Returns a list of the most similar text snippets.
--   **`load_from_file(filepath)`:** Loads knowledge items and their embeddings from a JSONL file.
+- **Adding Items:** Adds a text snippet and its embedding to the database.
+- **Searching Items:** Searches the database for the `k` most similar items to the given query embedding using cosine similarity. Returns a list of the most similar text snippets.
+- **Loading from File:** Loads knowledge items and their embeddings from a JSONL file.
 
 The chat interface uses this vector database to retrieve relevant context for each user query:
 
 1. **Generate Embedding:** The user's query (or the intermediate reasoning step) is converted into an embedding using the embedding model.
-2. **Retrieve Context:** The `KnowledgeBase.search()` function is used to find the most similar items in the knowledge base.
+2. **Retrieve Context:** The vector database is searched for the most similar items based on cosine similarity.
 3. **Augment Prompt:** The retrieved context is added to the prompt sent to the chat model, along with the conversation history.
 
 This process allows the model to generate responses that are more informed and relevant to the user's query by leveraging the information stored in the knowledge base.
@@ -261,7 +261,7 @@ A: Here are some tips for improving performance:
 
 **Q: Why is this not compatible with LM Studio 0.3.5 or later?**
 
-A: Later versions of LM Studio have introduced significant changes to the API and model handling, which are not compatible with the current implementation of this project. Using LM Studio 0.2.31 is required for this application to function correctly. They also removed K and V cache Quant, which really slows down output generation.
+A: Later versions of LM Studio have introduced significant changes to the API and model handling, which are not compatible with the current implementation of this project. Using LM Studio 0.2.31 is required for this application to function correctly.
 
 ## 📞 Contact
 
